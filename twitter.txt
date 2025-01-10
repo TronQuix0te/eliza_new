@@ -1,0 +1,659 @@
+Project Path: plugin-twitter
+
+Source Tree:
+
+```
+plugin-twitter
+├── src
+│   ├── templates.ts
+│   ├── actions
+│   │   └── post.ts
+│   ├── types.ts
+│   └── index.ts
+├── package.json
+├── README.md
+├── tsup.config.ts
+└── tsconfig.json
+
+```
+
+`/root/eliza_new/packages/plugin-twitter/src/templates.ts`:
+
+```ts
+export const tweetTemplate = `
+# Context
+{{recentMessages}}
+
+# Topics
+{{topics}}
+
+# Post Directions
+{{postDirections}}
+
+# Recent interactions between {{agentName}} and other users:
+{{recentPostInteractions}}
+
+# Task
+Generate a tweet that:
+1. Relates to the recent conversation or requested topic
+2. Matches the character's style and voice
+3. Is concise and engaging
+4. Must be UNDER 180 characters (this is a strict requirement)
+5. Speaks from the perspective of {{agentName}}
+
+Generate only the tweet text, no other commentary.`;
+
+```
+
+`/root/eliza_new/packages/plugin-twitter/src/actions/post.ts`:
+
+```ts
+import {
+    Action,
+    IAgentRuntime,
+    Memory,
+    State,
+    composeContext,
+    elizaLogger,
+    ModelClass,
+    formatMessages,
+    generateObject,
+} from "@elizaos/core";
+import { Scraper } from "agent-twitter-client";
+import { tweetTemplate } from "../templates";
+import { isTweetContent, TweetSchema } from "../types";
+
+async function composeTweet(
+    runtime: IAgentRuntime,
+    _message: Memory,
+    state?: State
+): Promise<string> {
+    try {
+        const context = composeContext({
+            state,
+            template: tweetTemplate,
+        });
+
+        const tweetContentObject = await generateObject({
+            runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+            schema: TweetSchema,
+            stop: ["\n"],
+        });
+
+        if (!isTweetContent(tweetContentObject.object)) {
+            elizaLogger.error(
+                "Invalid tweet content:",
+                tweetContentObject.object
+            );
+            return;
+        }
+
+        const trimmedContent = tweetContentObject.object.text.trim();
+
+        // Skip truncation if TWITTER_PREMIUM is true
+        if (
+            process.env.TWITTER_PREMIUM?.toLowerCase() !== "true" &&
+            trimmedContent.length > 180
+        ) {
+            elizaLogger.warn(
+                `Tweet too long (${trimmedContent.length} chars), truncating...`
+            );
+            return trimmedContent.substring(0, 177) + "...";
+        }
+
+        return trimmedContent;
+    } catch (error) {
+        elizaLogger.error("Error composing tweet:", error);
+        throw error;
+    }
+}
+
+async function postTweet(content: string): Promise<boolean> {
+    try {
+        const scraper = new Scraper();
+        const username = process.env.TWITTER_USERNAME;
+        const password = process.env.TWITTER_PASSWORD;
+        const email = process.env.TWITTER_EMAIL;
+        const twitter2faSecret = process.env.TWITTER_2FA_SECRET;
+
+        if (!username || !password) {
+            elizaLogger.error(
+                "Twitter credentials not configured in environment"
+            );
+            return false;
+        }
+
+        // Login with credentials
+        await scraper.login(username, password, email, twitter2faSecret);
+        if (!(await scraper.isLoggedIn())) {
+            elizaLogger.error("Failed to login to Twitter");
+            return false;
+        }
+
+        // Send the tweet
+        elizaLogger.log("Attempting to send tweet:", content);
+        const result = await scraper.sendTweet(content);
+
+        const body = await result.json();
+        elizaLogger.log("Tweet response:", body);
+
+        // Check for Twitter API errors
+        if (body.errors) {
+            const error = body.errors[0];
+            elizaLogger.error(
+                `Twitter API error (${error.code}): ${error.message}`
+            );
+            return false;
+        }
+
+        // Check for successful tweet creation
+        if (!body?.data?.create_tweet?.tweet_results?.result) {
+            elizaLogger.error(
+                "Failed to post tweet: No tweet result in response"
+            );
+            return false;
+        }
+
+        return true;
+    } catch (error) {
+        // Log the full error details
+        elizaLogger.error("Error posting tweet:", {
+            message: error.message,
+            stack: error.stack,
+            name: error.name,
+            cause: error.cause,
+        });
+        return false;
+    }
+}
+
+export const postAction: Action = {
+    name: "POST_TWEET",
+    similes: ["TWEET", "POST", "SEND_TWEET"],
+    description: "Post a tweet to Twitter",
+    validate: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state?: State
+    ) => {
+        const hasCredentials =
+            !!process.env.TWITTER_USERNAME && !!process.env.TWITTER_PASSWORD;
+        elizaLogger.log(`Has credentials: ${hasCredentials}`);
+
+        return hasCredentials;
+    },
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state?: State
+    ): Promise<boolean> => {
+        try {
+            // Generate tweet content using context
+            const tweetContent = await composeTweet(runtime, message, state);
+
+            if (!tweetContent) {
+                elizaLogger.error("No content generated for tweet");
+                return false;
+            }
+
+            elizaLogger.log(`Generated tweet content: ${tweetContent}`);
+
+            // Check for dry run mode - explicitly check for string "true"
+            if (
+                process.env.TWITTER_DRY_RUN &&
+                process.env.TWITTER_DRY_RUN.toLowerCase() === "true"
+            ) {
+                elizaLogger.info(
+                    `Dry run: would have posted tweet: ${tweetContent}`
+                );
+                return true;
+            }
+
+            return await postTweet(tweetContent);
+        } catch (error) {
+            elizaLogger.error("Error in post action:", error);
+            return false;
+        }
+    },
+    examples: [
+        [
+            {
+                user: "{{user1}}",
+                content: { text: "You should tweet that" },
+            },
+            {
+                user: "{{agentName}}",
+                content: {
+                    text: "I'll share this update with my followers right away!",
+                    action: "POST_TWEET",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: { text: "Post this tweet" },
+            },
+            {
+                user: "{{agentName}}",
+                content: {
+                    text: "I'll post that as a tweet now.",
+                    action: "POST_TWEET",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: { text: "Share that on Twitter" },
+            },
+            {
+                user: "{{agentName}}",
+                content: {
+                    text: "I'll share this message on Twitter.",
+                    action: "POST_TWEET",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: { text: "Post that on X" },
+            },
+            {
+                user: "{{agentName}}",
+                content: {
+                    text: "I'll post this message on X right away.",
+                    action: "POST_TWEET",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: { text: "You should put that on X dot com" },
+            },
+            {
+                user: "{{agentName}}",
+                content: {
+                    text: "I'll put this message up on X.com now.",
+                    action: "POST_TWEET",
+                },
+            },
+        ],
+    ],
+};
+
+```
+
+`/root/eliza_new/packages/plugin-twitter/src/types.ts`:
+
+```ts
+import { z } from "zod";
+
+export interface TweetContent {
+    text: string;
+}
+
+export const TweetSchema = z.object({
+    text: z.string().describe("The text of the tweet"),
+});
+
+export const isTweetContent = (obj: any): obj is TweetContent => {
+    return TweetSchema.safeParse(obj).success;
+};
+
+```
+
+`/root/eliza_new/packages/plugin-twitter/src/index.ts`:
+
+```ts
+import { Plugin } from "@elizaos/core";
+import { postAction } from "./actions/post";
+
+export const twitterPlugin: Plugin = {
+    name: "twitter",
+    description: "Twitter integration plugin for posting tweets",
+    actions: [postAction],
+    evaluators: [],
+    providers: [],
+};
+
+export default twitterPlugin;
+
+```
+
+`/root/eliza_new/packages/plugin-twitter/package.json`:
+
+```json
+{
+    "name": "@elizaos/plugin-twitter",
+    "version": "0.1.7",
+    "type": "module",
+    "main": "dist/index.js",
+    "module": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+        "./package.json": "./package.json",
+        ".": {
+            "import": {
+                "@elizaos/source": "./src/index.ts",
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            }
+        }
+    },
+    "files": [
+        "dist"
+    ],
+    "dependencies": {
+        "@elizaos/core": "workspace:*",
+        "agent-twitter-client": "0.0.17",
+        "tsup": "8.3.5"
+    },
+    "scripts": {
+        "build": "tsup --format esm --dts",
+        "dev": "tsup --format esm --dts --watch",
+        "test": "vitest run"
+    }
+}
+
+```
+
+`/root/eliza_new/packages/plugin-twitter/README.md`:
+
+```md
+# @elizaos/plugin-twitter
+
+A plugin for Twitter/X integration, providing automated tweet posting capabilities with character-aware content generation.
+
+## Overview
+
+This plugin provides functionality to:
+- Compose context-aware tweets
+- Post tweets to Twitter/X platform
+- Handle authentication and session management
+- Support premium Twitter features
+- Manage tweet length restrictions
+
+## Installation
+
+```bash
+npm install @elizaos/plugin-twitter
+```
+
+## Configuration
+
+The plugin requires the following environment variables:
+
+```env
+TWITTER_USERNAME=your_username
+TWITTER_PASSWORD=your_password
+TWITTER_EMAIL=your_email              # Optional: for 2FA
+TWITTER_2FA_SECRET=your_2fa_secret    # Optional: for 2FA
+TWITTER_PREMIUM=false                 # Optional: enables premium features
+TWITTER_DRY_RUN=false                # Optional: test without posting
+```
+
+## Usage
+
+Import and register the plugin in your Eliza configuration:
+
+```typescript
+import { twitterPlugin } from "@elizaos/plugin-twitter";
+
+export default {
+  plugins: [twitterPlugin],
+  // ... other configuration
+};
+```
+
+## Features
+
+### Tweet Composition
+
+The plugin uses context-aware templates to generate appropriate tweets:
+
+```typescript
+import { postAction } from "@elizaos/plugin-twitter";
+
+// Tweet will be composed based on context and character limits
+const result = await postAction.handler(runtime, message, state);
+```
+
+### Tweet Posting
+
+```typescript
+// Post with automatic content generation
+await postAction.handler(runtime, message, state);
+
+// Dry run mode (for testing)
+process.env.TWITTER_DRY_RUN = "true";
+await postAction.handler(runtime, message, state);
+```
+
+## Development
+
+### Building
+
+```bash
+npm run build
+```
+
+### Testing
+
+```bash
+npm run test
+```
+
+### Development Mode
+
+```bash
+npm run dev
+```
+
+## Dependencies
+
+- `@elizaos/core`: Core Eliza functionality
+- `agent-twitter-client`: Twitter API client
+- `tsup`: Build tool
+- Other standard dependencies listed in package.json
+
+## API Reference
+
+### Core Interfaces
+
+```typescript
+interface TweetContent {
+    text: string;
+}
+
+// Tweet Schema
+const TweetSchema = z.object({
+    text: z.string().describe("The text of the tweet")
+});
+
+// Action Interface
+interface Action {
+    name: "POST_TWEET";
+    similes: string[];
+    description: string;
+    validate: (runtime: IAgentRuntime, message: Memory, state?: State) => Promise<boolean>;
+    handler: (runtime: IAgentRuntime, message: Memory, state?: State) => Promise<boolean>;
+    examples: Array<Array<any>>;
+}
+```
+
+### Plugin Methods
+
+- `postAction.handler`: Main method for posting tweets
+- `postAction.validate`: Validates Twitter credentials
+- `composeTweet`: Internal method for tweet generation
+- `postTweet`: Internal method for tweet posting
+
+## Common Issues/Troubleshooting
+
+### Issue: Authentication Failures
+- **Cause**: Invalid credentials or 2FA configuration
+- **Solution**: Verify credentials and 2FA setup
+
+### Issue: Tweet Length Errors
+- **Cause**: Content exceeds Twitter's character limit
+- **Solution**: Enable TWITTER_PREMIUM for extended tweets or ensure content is within limits
+
+### Issue: Rate Limiting
+- **Cause**: Too many requests in short time
+- **Solution**: Implement proper request throttling
+
+## Security Best Practices
+
+- Store credentials securely using environment variables
+- Use 2FA when possible
+- Implement proper error handling
+- Keep dependencies updated
+- Use dry run mode for testing
+- Monitor Twitter API usage
+
+## Template System
+
+The plugin uses a sophisticated template system for tweet generation:
+
+```typescript
+const tweetTemplate = `
+# Context
+{{recentMessages}}
+
+# Topics
+{{topics}}
+
+# Post Directions
+{{postDirections}}
+
+# Recent interactions
+{{recentPostInteractions}}
+
+# Task
+Generate a tweet that:
+1. Relates to the recent conversation
+2. Matches the character's style
+3. Is concise and engaging
+4. Must be UNDER 180 characters
+5. Speaks from the perspective of {{agentName}}
+`;
+```
+
+## Future Enhancements
+
+1. **Content Generation**
+   - Advanced context awareness
+   - Multi-language support
+   - Style customization
+   - Hashtag optimization
+   - Media generation
+   - Thread composition
+
+2. **Engagement Features**
+   - Auto-reply system
+   - Engagement analytics
+   - Follower management
+   - Interaction scheduling
+   - Sentiment analysis
+   - Community management
+
+3. **Tweet Management**
+   - Thread management
+   - Tweet scheduling
+   - Content moderation
+   - Archive management
+   - Delete automation
+   - Edit optimization
+
+4. **Analytics Integration**
+   - Performance tracking
+   - Engagement metrics
+   - Audience insights
+   - Trend analysis
+   - ROI measurement
+   - Custom reporting
+
+5. **Authentication**
+   - OAuth improvements
+   - Multi-account support
+   - Session management
+   - Rate limit handling
+   - Security enhancements
+   - Backup mechanisms
+
+6. **Developer Tools**
+   - Enhanced debugging
+   - Testing framework
+   - Documentation generator
+   - Integration templates
+   - Error handling
+   - Logging system
+
+We welcome community feedback and contributions to help prioritize these enhancements.
+
+## Contributing
+
+Contributions are welcome! Please see the [CONTRIBUTING.md](CONTRIBUTING.md) file for more information.
+
+
+## Credits
+
+This plugin integrates with and builds upon several key technologies:
+
+- [Twitter/X API](https://developer.twitter.com/en/docs): Official Twitter platform API
+- [agent-twitter-client](https://www.npmjs.com/package/agent-twitter-client): Twitter API client library
+- [Zod](https://github.com/colinhacks/zod): TypeScript-first schema validation
+
+Special thanks to:
+- The Twitter/X Developer Platform team
+- The agent-twitter-client maintainers for API integration tools
+- The Eliza community for their contributions and feedback
+
+For more information about Twitter/X integration capabilities:
+- [Twitter API Documentation](https://developer.twitter.com/en/docs)
+- [Twitter Developer Portal](https://developer.twitter.com/en/portal/dashboard)
+- [Twitter API Best Practices](https://developer.twitter.com/en/docs/twitter-api/rate-limits)
+
+## License
+
+This plugin is part of the Eliza project. See the main project repository for license information.
+```
+
+`/root/eliza_new/packages/plugin-twitter/tsup.config.ts`:
+
+```ts
+import { defineConfig } from "tsup";
+
+export default defineConfig({
+    entry: ["src/index.ts"],
+    outDir: "dist",
+    sourcemap: true,
+    clean: true,
+    format: ["esm"],
+    external: ["dotenv", "fs", "path", "https", "http", "agentkeepalive"],
+});
+
+```
+
+`/root/eliza_new/packages/plugin-twitter/tsconfig.json`:
+
+```json
+{
+    "extends": "../core/tsconfig.json",
+    "compilerOptions": {
+        "outDir": "dist",
+        "rootDir": "src",
+        "types": [
+            "node"
+        ]
+    },
+    "include": [
+        "src/**/*.ts"
+    ]
+}
+```
