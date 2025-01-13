@@ -388,7 +388,7 @@ export class TwitterInteractionClient {
                 this.runtime.character?.templates?.shouldRespondTemplate ||
                 twitterShouldRespondTemplate(validTargetUsersStr),
         });
-
+        console.log("Should Respond prompt:\n" + shouldRespondContext);
         const shouldRespond = await generateShouldRespond({
             runtime: this.runtime,
             context: shouldRespondContext,

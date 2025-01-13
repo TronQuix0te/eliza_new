@@ -1,0 +1,5924 @@
+Project Path: client-discord
+
+Source Tree:
+
+```
+client-discord
+├── src
+│   ├── messages.ts
+│   ├── constants.ts
+│   ├── templates.ts
+│   ├── environment.ts
+│   ├── actions
+│   │   ├── chat_with_attachments.ts
+│   │   ├── summarize_conversation.ts
+│   │   ├── transcribe_media.ts
+│   │   ├── leavevoice.ts
+│   │   ├── joinvoice.ts
+│   │   └── download_media.ts
+│   ├── providers
+│   │   ├── channelState.ts
+│   │   └── voiceState.ts
+│   ├── voice.ts
+│   ├── attachments.ts
+│   ├── utils.ts
+│   └── index.ts
+├── package.json
+├── tsup.config.ts
+├── tsconfig.json
+└── eslint.config.mjs
+
+```
+
+`/root/eliza_new/packages/client-discord/src/messages.ts`:
+
+```ts
+import { composeContext, composeRandomUser } from "@elizaos/core";
+import { generateMessageResponse, generateShouldRespond } from "@elizaos/core";
+import {
+    Content,
+    HandlerCallback,
+    IAgentRuntime,
+    IBrowserService,
+    ISpeechService,
+    IVideoService,
+    Media,
+    Memory,
+    ModelClass,
+    ServiceType,
+    State,
+    UUID,
+} from "@elizaos/core";
+import { stringToUuid, getEmbeddingZeroVector } from "@elizaos/core";
+import {
+    ChannelType,
+    Client,
+    Message as DiscordMessage,
+    TextChannel,
+} from "discord.js";
+import { elizaLogger } from "@elizaos/core";
+import { AttachmentManager } from "./attachments.ts";
+import { VoiceManager } from "./voice.ts";
+import {
+    discordShouldRespondTemplate,
+    discordMessageHandlerTemplate,
+} from "./templates.ts";
+import {
+    IGNORE_RESPONSE_WORDS,
+    LOSE_INTEREST_WORDS,
+    MESSAGE_CONSTANTS,
+    MESSAGE_LENGTH_THRESHOLDS,
+    RESPONSE_CHANCES,
+    TEAM_COORDINATION,
+    TIMING_CONSTANTS,
+} from "./constants";
+import {
+    sendMessageInChunks,
+    canSendMessage,
+    cosineSimilarity,
+} from "./utils.ts";
+
+interface MessageContext {
+    content: string;
+    timestamp: number;
+}
+
+interface ChannelData {
+    currentHandler: string;
+    lastMessageSent: number;
+    messages: { userId: UUID; userName: string; content: Content; }[];
+    previousContext?: MessageContext;
+    contextSimilarityThreshold?: number;
+    repetitionCount?: number; // Add this line
+}
+
+export type InterestChannels = {
+    [key: string]: {
+        currentHandler: string | undefined;
+        lastMessageSent: number;
+        messages: { userId: UUID; userName: string; content: Content }[];
+        previousContext?: MessageContext;
+        contextSimilarityThreshold?: number;
+        repetitionCount?: number;
+    };
+}
+
+export class MessageManager {
+    private client: Client;
+    private runtime: IAgentRuntime;
+    private attachmentManager: AttachmentManager;
+    private interestChannels: InterestChannels = {};
+    private discordClient: any;
+    private voiceManager: VoiceManager;
+
+    constructor(discordClient: any, voiceManager: VoiceManager) {
+        this.client = discordClient.client;
+        this.voiceManager = voiceManager;
+        this.discordClient = discordClient;
+        this.runtime = discordClient.runtime;
+        this.attachmentManager = new AttachmentManager(this.runtime);
+    }
+
+
+    private cleanRepeatedMessages(channelId: string, newMessage: string) {
+        if (!this.interestChannels[channelId]) return;
+
+        // Count repetitions before cleaning
+        const repetitionCount = this.interestChannels[channelId].messages.filter(
+            (msg) => msg.content.text === newMessage
+        ).length;
+
+        // Store repetition count before cleaning
+        this.interestChannels[channelId].repetitionCount = repetitionCount;
+
+        // Filter out repeated messages, only keeping the last occurrence
+        const cleanedMessages = this.interestChannels[channelId].messages.filter(
+            (msg, index, arr) => {
+                return msg.content.text !== newMessage || index === arr.length - 1;
+            }
+        );
+
+        // Update messages with the cleaned version
+        this.interestChannels[channelId].messages = cleanedMessages;
+    }
+    
+    public clearChannelHistory(channelId: string) {
+        if (this.interestChannels[channelId]) {
+            elizaLogger.log(`Clearing history for channel ${channelId}`);
+            this.interestChannels[channelId].messages = [];
+            this.interestChannels[channelId].lastMessageSent = Date.now();
+        }
+    }
+
+    async handleMessage(message: DiscordMessage) {
+        // Add at start of handler
+
+        elizaLogger.log("Received message:", {
+            content: message.content,
+            channelId: message.channelId,
+            hasInterest: this._checkInterest(message.channelId),
+        });
+
+        this.clearChannelHistory(message.channelId);
+
+        if (
+            message.interaction ||
+            message.author.id ===
+                this.client.user?.id /* || message.author?.bot*/
+        ) {
+            return;
+        }
+
+        if (
+            this.runtime.character.clientConfig?.discord
+                ?.shouldIgnoreBotMessages &&
+            message.author?.bot
+        ) {
+            return;
+        }
+
+        // Check for mentions-only mode setting
+        if (
+            this.runtime.character.clientConfig?.discord
+                ?.shouldRespondOnlyToMentions
+        ) {
+            if (!this._isMessageForMe(message)) {
+                return;
+            }
+        }
+
+        if (
+            this.runtime.character.clientConfig?.discord
+                ?.shouldIgnoreDirectMessages &&
+            message.channel.type === ChannelType.DM
+        ) {
+            return;
+        }
+
+        const userId = message.author.id as UUID;
+        const userName = message.author.username;
+        const name = message.author.displayName;
+        const channelId = message.channel.id;
+        const isDirectlyMentioned = this._isMessageForMe(message);
+        const hasInterest = this._checkInterest(message.channelId);
+
+        // Team handling
+        if (
+            this.runtime.character.clientConfig?.discord?.isPartOfTeam &&
+            !this.runtime.character.clientConfig?.discord
+                ?.shouldRespondOnlyToMentions
+        ) {
+            const authorId = this._getNormalizedUserId(message.author.id);
+
+            if (
+                !this._isTeamLeader() &&
+                this._isRelevantToTeamMember(message.content, channelId)
+            ) {
+                this.interestChannels[message.channelId] = {
+                    currentHandler: this.client.user?.id,
+                    lastMessageSent: Date.now(),
+                    messages: [],
+                };
+            }
+
+            const isTeamRequest = this._isTeamCoordinationRequest(
+                message.content
+            );
+            const isLeader = this._isTeamLeader();
+
+            // After team-wide responses, check if we should maintain interest
+            if (hasInterest && !isDirectlyMentioned) {
+                const lastSelfMemories =
+                    await this.runtime.messageManager.getMemories({
+                        roomId: stringToUuid(
+                            channelId + "-" + this.runtime.agentId
+                        ),
+                        unique: false,
+                        count: 5,
+                    });
+
+                const lastSelfSortedMemories = lastSelfMemories
+                    ?.filter((m) => m.userId === this.runtime.agentId)
+                    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+                const isRelevant = this._isRelevantToTeamMember(
+                    message.content,
+                    channelId,
+                    lastSelfSortedMemories?.[0]
+                );
+
+                if (!isRelevant) {
+                    // Clearing interest - conversation not relevant to team member
+                    delete this.interestChannels[message.channelId];
+                    return;
+                }
+            }
+
+            if (isTeamRequest) {
+                if (isLeader) {
+                    this.interestChannels[message.channelId] = {
+                        currentHandler: this.client.user?.id,
+                        lastMessageSent: Date.now(),
+                        messages: [],
+                    };
+                } else {
+                    // Set temporary interest for this response
+                    this.interestChannels[message.channelId] = {
+                        currentHandler: this.client.user?.id,
+                        lastMessageSent: Date.now(),
+                        messages: [],
+                    };
+
+                    // Clear interest after this cycle unless directly mentioned
+                    if (!isDirectlyMentioned) {
+                        // Use existing message cycle to clear interest
+                        this.interestChannels[
+                            message.channelId
+                        ].lastMessageSent = 0;
+                    }
+                }
+            }
+
+            // Check for other team member mentions
+            const otherTeamMembers =
+                this.runtime.character.clientConfig.discord.teamAgentIds.filter(
+                    (id) => id !== this.client.user?.id
+                );
+            const mentionedTeamMember = otherTeamMembers.find((id) =>
+                message.content.includes(`<@${id}>`)
+            );
+
+            // If another team member is mentioned, clear our interest
+            if (mentionedTeamMember) {
+                if (
+                    hasInterest ||
+                    this.interestChannels[message.channelId]?.currentHandler ===
+                        this.client.user?.id
+                ) {
+                    delete this.interestChannels[message.channelId];
+
+                    // Only return if we're not the mentioned member
+                    if (!isDirectlyMentioned) {
+                        return;
+                    }
+                }
+            }
+
+            // Set/maintain interest only if we're mentioned or already have interest
+            if (isDirectlyMentioned) {
+                this.interestChannels[message.channelId] = {
+                    currentHandler: this.client.user?.id,
+                    lastMessageSent: Date.now(),
+                    messages: [],
+                };
+            } else if (!isTeamRequest && !hasInterest) {
+                return;
+            }
+
+            // Bot-specific checks
+            if (message.author.bot) {
+                if (this._isTeamMember(authorId) && !isDirectlyMentioned) {
+                    return;
+                } else if (
+                    this.runtime.character.clientConfig.discord
+                        .shouldIgnoreBotMessages
+                ) {
+                    return;
+                }
+            }
+        }
+
+        try {
+            const { processedContent, attachments } =
+                await this.processMessageMedia(message);
+
+
+                elizaLogger.log("Processing message:", {
+                    processed: processedContent,
+                    hasAttachments: attachments.length > 0
+                });
+
+            const audioAttachments = message.attachments.filter((attachment) =>
+                attachment.contentType?.startsWith("audio/")
+            );
+            if (audioAttachments.size > 0) {
+                const processedAudioAttachments =
+                    await this.attachmentManager.processAttachments(
+                        audioAttachments
+                    );
+                attachments.push(...processedAudioAttachments);
+            }
+
+            const roomId = stringToUuid(channelId + "-" + this.runtime.agentId);
+            const userIdUUID = stringToUuid(userId);
+
+            await this.runtime.ensureConnection(
+                userIdUUID,
+                roomId,
+                userName,
+                name,
+                "discord"
+            );
+
+            const messageId = stringToUuid(
+                message.id + "-" + this.runtime.agentId
+            );
+
+            let shouldIgnore = false;
+            let shouldRespond = true;
+
+            const content: Content = {
+                text: processedContent,
+                attachments: attachments,
+                source: "discord",
+                url: message.url,
+                inReplyTo: message.reference?.messageId
+                    ? stringToUuid(
+                          message.reference.messageId +
+                              "-" +
+                              this.runtime.agentId
+                      )
+                    : undefined,
+            };
+
+            const userMessage = {
+                content,
+                userId: userIdUUID,
+                agentId: this.runtime.agentId,
+                roomId,
+            };
+
+            const memory: Memory = {
+                id: stringToUuid(message.id + "-" + this.runtime.agentId),
+                ...userMessage,
+                userId: userIdUUID,
+                agentId: this.runtime.agentId,
+                roomId,
+                content,
+                createdAt: message.createdTimestamp,
+            };
+
+            if (content.text) {
+                await this.runtime.messageManager.addEmbeddingToMemory(memory);
+                await this.runtime.messageManager.createMemory(memory);
+
+                if (this.interestChannels[message.channelId]) {
+                    // Add new message
+                    this.interestChannels[message.channelId].messages.push({
+                        userId: userIdUUID,
+                        userName: userName,
+                        content: content,
+                    });
+
+                    // Add this line to clean repeated messages
+                    this.cleanRepeatedMessages(message.channelId, content.text);
+
+                    // Trim to keep only recent messages
+                    if (
+                        this.interestChannels[message.channelId].messages
+                            .length > MESSAGE_CONSTANTS.MAX_MESSAGES
+                    ) {
+                        this.interestChannels[message.channelId].messages =
+                            this.interestChannels[
+                                message.channelId
+                            ].messages.slice(-MESSAGE_CONSTANTS.MAX_MESSAGES);
+                    }
+                }
+
+                if (this.interestChannels[message.channelId]) {
+                    // Add new message
+                    this.interestChannels[message.channelId].messages.push({
+                        userId: userIdUUID,
+                        userName: userName,
+                        content: content,
+                    });
+
+                    // Trim to keep only recent messages
+                    if (
+                        this.interestChannels[message.channelId].messages
+                            .length > MESSAGE_CONSTANTS.MAX_MESSAGES
+                    ) {
+                        this.interestChannels[message.channelId].messages =
+                            this.interestChannels[
+                                message.channelId
+                            ].messages.slice(-MESSAGE_CONSTANTS.MAX_MESSAGES);
+                    }
+                }
+            }
+
+            let state = await this.runtime.composeState(userMessage, {
+                discordClient: this.client,
+                discordMessage: message,
+                agentName:
+                    this.runtime.character.name ||
+                    this.client.user?.displayName,
+            });
+
+            const canSendResult = canSendMessage(message.channel);
+            if (!canSendResult.canSend) {
+                return elizaLogger.warn(
+                    `Cannot send message to channel ${message.channel}`,
+                    canSendResult
+                );
+            }
+
+            if (!shouldIgnore) {
+                shouldIgnore = await this._shouldIgnore(message);
+
+                elizaLogger.log("Should ignore?", { shouldIgnore });
+            }
+
+            if (shouldIgnore) {
+                return;
+            }
+
+            const agentUserState =
+                await this.runtime.databaseAdapter.getParticipantUserState(
+                    roomId,
+                    this.runtime.agentId
+                );
+
+            if (
+                agentUserState === "MUTED" &&
+                !message.mentions.has(this.client.user.id) &&
+                !hasInterest
+            ) {
+                console.log("Ignoring muted room");
+                // Ignore muted rooms unless explicitly mentioned
+                return;
+            }
+
+            if (agentUserState === "FOLLOWED") {
+                shouldRespond = true; // Always respond in followed rooms
+            } else if (
+                (!shouldRespond && hasInterest) ||
+                (shouldRespond && !hasInterest)
+            ) {
+                shouldRespond = await this._shouldRespond(message, state);
+            }
+
+            elizaLogger.log("Checking if should respond", {
+                hasInterest: this._checkInterest(message.channelId),
+                channelState: this.interestChannels[message.channelId]
+            });
+
+            if (shouldRespond) {
+                elizaLogger.log("Generating response...");
+                // ... response generation ...
+            } else {
+                elizaLogger.log("Decided not to respond");
+            }
+
+            if (shouldRespond) {
+                const context = composeContext({
+                    state,
+                    template:
+                        this.runtime.character.templates
+                            ?.discordMessageHandlerTemplate ||
+                        discordMessageHandlerTemplate,
+                });
+
+                // simulate discord typing while generating a response
+                const stopTyping = this.simulateTyping(message);
+
+                const responseContent = await this._generateResponse(
+                    memory,
+                    state,
+                    context
+                ).finally(() => {
+                    stopTyping();
+                });
+
+                responseContent.text = responseContent.text?.trim();
+                responseContent.inReplyTo = stringToUuid(
+                    message.id + "-" + this.runtime.agentId
+                );
+
+                if (!responseContent.text) {
+                    return;
+                }
+
+                const callback: HandlerCallback = async (
+                    content: Content,
+                    files: any[]
+                ) => {
+                    try {
+                        if (message.id && !content.inReplyTo) {
+                            content.inReplyTo = stringToUuid(
+                                message.id + "-" + this.runtime.agentId
+                            );
+                        }
+                        const messages = await sendMessageInChunks(
+                            message.channel as TextChannel,
+                            content.text,
+                            message.id,
+                            files
+                        );
+
+                        const memories: Memory[] = [];
+                        for (const m of messages) {
+                            let action = content.action;
+                            // If there's only one message or it's the last message, keep the original action
+                            // For multiple messages, set all but the last to 'CONTINUE'
+                            if (
+                                messages.length > 1 &&
+                                m !== messages[messages.length - 1]
+                            ) {
+                                action = "CONTINUE";
+                            }
+
+                            const memory: Memory = {
+                                id: stringToUuid(
+                                    m.id + "-" + this.runtime.agentId
+                                ),
+                                userId: this.runtime.agentId,
+                                agentId: this.runtime.agentId,
+                                content: {
+                                    ...content,
+                                    action,
+                                    inReplyTo: messageId,
+                                    url: m.url,
+                                },
+                                roomId,
+                                embedding: getEmbeddingZeroVector(),
+                                createdAt: m.createdTimestamp,
+                            };
+                            memories.push(memory);
+                        }
+                        for (const m of memories) {
+                            await this.runtime.messageManager.createMemory(m);
+                        }
+                        return memories;
+                    } catch (error) {
+                        console.error("Error sending message:", error);
+                        return [];
+                    }
+                };
+
+                const responseMessages = await callback(responseContent);
+
+                state = await this.runtime.updateRecentMessageState(state);
+
+                await this.runtime.processActions(
+                    memory,
+                    responseMessages,
+                    state,
+                    callback
+                );
+            }
+            await this.runtime.evaluate(memory, state, shouldRespond);
+        } catch (error) {
+            console.error("Error handling message:", error);
+            if (message.channel.type === ChannelType.GuildVoice) {
+                // For voice channels, use text-to-speech for the error message
+                const errorMessage = "Sorry, I had a glitch. What was that?";
+
+                const speechService = this.runtime.getService<ISpeechService>(
+                    ServiceType.SPEECH_GENERATION
+                );
+                if (!speechService) {
+                    throw new Error("Speech generation service not found");
+                }
+
+                const audioStream = await speechService.generate(
+                    this.runtime,
+                    errorMessage
+                );
+                await this.voiceManager.playAudioStream(userId, audioStream);
+            } else {
+                // For text channels, send the error message
+                console.error("Error sending message:", error);
+            }
+        }
+    }
+
+    async cacheMessages(channel: TextChannel, count: number = 20) {
+        const messages = await channel.messages.fetch({ limit: count });
+
+        // TODO: This is throwing an error but seems to work?
+        for (const [_, message] of messages) {
+            await this.handleMessage(message);
+        }
+    }
+
+    private _isMessageForMe(message: DiscordMessage): boolean {
+        const isMentioned = message.mentions.users?.has(
+            this.client.user?.id as string
+        );
+        const guild = message.guild;
+        const member = guild?.members.cache.get(this.client.user?.id as string);
+        const nickname = member?.nickname;
+
+        // Don't consider role mentions as direct mentions
+        const hasRoleMentionOnly =
+            message.mentions.roles.size > 0 && !isMentioned;
+
+        // If it's only a role mention and we're in team mode, let team logic handle it
+        if (
+            hasRoleMentionOnly &&
+            this.runtime.character.clientConfig?.discord?.isPartOfTeam
+        ) {
+            return false;
+        }
+
+        return (
+            isMentioned ||
+            (!this.runtime.character.clientConfig?.discord
+                ?.shouldRespondOnlyToMentions &&
+                (message.content
+                    .toLowerCase()
+                    .includes(
+                        this.client.user?.username.toLowerCase() as string
+                    ) ||
+                    message.content
+                        .toLowerCase()
+                        .includes(
+                            this.client.user?.tag.toLowerCase() as string
+                        ) ||
+                    (nickname &&
+                        message.content
+                            .toLowerCase()
+                            .includes(nickname.toLowerCase()))))
+        );
+    }
+
+    async processMessageMedia(
+        message: DiscordMessage
+    ): Promise<{ processedContent: string; attachments: Media[] }> {
+        let processedContent = message.content;
+
+        let attachments: Media[] = [];
+
+        // Process code blocks in the message content
+        const codeBlockRegex = /```([\s\S]*?)```/g;
+        let match;
+        while ((match = codeBlockRegex.exec(processedContent))) {
+            const codeBlock = match[1];
+            const lines = codeBlock.split("\n");
+            const title = lines[0];
+            const description = lines.slice(0, 3).join("\n");
+            const attachmentId =
+                `code-${Date.now()}-${Math.floor(Math.random() * 1000)}`.slice(
+                    -5
+                );
+            attachments.push({
+                id: attachmentId,
+                url: "",
+                title: title || "Code Block",
+                source: "Code",
+                description: description,
+                text: codeBlock,
+            });
+            processedContent = processedContent.replace(
+                match[0],
+                `Code Block (${attachmentId})`
+            );
+        }
+
+        // Process message attachments
+        if (message.attachments.size > 0) {
+            attachments = await this.attachmentManager.processAttachments(
+                message.attachments
+            );
+        }
+
+        // TODO: Move to attachments manager
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const urls = processedContent.match(urlRegex) || [];
+
+        for (const url of urls) {
+            if (
+                this.runtime
+                    .getService<IVideoService>(ServiceType.VIDEO)
+                    ?.isVideoUrl(url)
+            ) {
+                const videoService = this.runtime.getService<IVideoService>(
+                    ServiceType.VIDEO
+                );
+                if (!videoService) {
+                    throw new Error("Video service not found");
+                }
+                const videoInfo = await videoService.processVideo(
+                    url,
+                    this.runtime
+                );
+
+                attachments.push({
+                    id: `youtube-${Date.now()}`,
+                    url: url,
+                    title: videoInfo.title,
+                    source: "YouTube",
+                    description: videoInfo.description,
+                    text: videoInfo.text,
+                });
+            } else {
+                const browserService = this.runtime.getService<IBrowserService>(
+                    ServiceType.BROWSER
+                );
+                if (!browserService) {
+                    throw new Error("Browser service not found");
+                }
+
+                const { title, description: summary } =
+                    await browserService.getPageContent(url, this.runtime);
+
+                attachments.push({
+                    id: `webpage-${Date.now()}`,
+                    url: url,
+                    title: title || "Web Page",
+                    source: "Web",
+                    description: summary,
+                    text: summary,
+                });
+            }
+        }
+
+        return { processedContent, attachments };
+    }
+
+    private _getNormalizedUserId(id: string): string {
+        return id.toString().replace(/[^0-9]/g, "");
+    }
+
+    private _isTeamMember(userId: string): boolean {
+        const teamConfig = this.runtime.character.clientConfig?.discord;
+        if (!teamConfig?.isPartOfTeam || !teamConfig.teamAgentIds) return false;
+
+        const normalizedUserId = this._getNormalizedUserId(userId);
+
+        const isTeamMember = teamConfig.teamAgentIds.some(
+            (teamId) => this._getNormalizedUserId(teamId) === normalizedUserId
+        );
+
+        return isTeamMember;
+    }
+
+    private _isTeamLeader(): boolean {
+        return (
+            this.client.user?.id ===
+            this.runtime.character.clientConfig?.discord?.teamLeaderId
+        );
+    }
+
+    private _isTeamCoordinationRequest(content: string): boolean {
+        const contentLower = content.toLowerCase();
+        return TEAM_COORDINATION.KEYWORDS?.some((keyword) =>
+            contentLower.includes(keyword.toLowerCase())
+        );
+    }
+
+    private _isRelevantToTeamMember(
+        content: string,
+        channelId: string,
+        lastAgentMemory: Memory | null = null
+    ): boolean {
+        const teamConfig = this.runtime.character.clientConfig?.discord;
+
+        if (this._isTeamLeader() && lastAgentMemory?.content.text) {
+            const timeSinceLastMessage = Date.now() - lastAgentMemory.createdAt;
+            if (timeSinceLastMessage > MESSAGE_CONSTANTS.INTEREST_DECAY_TIME) {
+                return false; // Memory too old, not relevant
+            }
+
+            const similarity = cosineSimilarity(
+                content.toLowerCase(),
+                lastAgentMemory.content.text.toLowerCase()
+            );
+
+            return (
+                similarity >=
+                MESSAGE_CONSTANTS.DEFAULT_SIMILARITY_THRESHOLD_FOLLOW_UPS
+            );
+        }
+
+        // If no keywords defined, only leader maintains conversation
+        if (!teamConfig?.teamMemberInterestKeywords) {
+            return false;
+        }
+
+        return teamConfig.teamMemberInterestKeywords.some((keyword) =>
+            content.toLowerCase().includes(keyword.toLowerCase())
+        );
+    }
+
+    private async _analyzeContextSimilarity(
+        currentMessage: string,
+        previousContext?: MessageContext,
+        agentLastMessage?: string
+    ): Promise<number> {
+        if (!previousContext) return 1; // No previous context to compare against
+
+        // If more than 5 minutes have passed, reduce similarity weight
+        const timeDiff = Date.now() - previousContext.timestamp;
+        const timeWeight = Math.max(0, 1 - timeDiff / (5 * 60 * 1000)); // 5 minutes threshold
+
+        // Calculate content similarity
+        const similarity = cosineSimilarity(
+            currentMessage.toLowerCase(),
+            previousContext.content.toLowerCase(),
+            agentLastMessage?.toLowerCase()
+        );
+
+        // Weight the similarity by time factor
+        const weightedSimilarity = similarity * timeWeight;
+
+        return weightedSimilarity;
+    }
+
+    private async _shouldRespondBasedOnContext(
+        message: DiscordMessage,
+        channelState: InterestChannels[string]
+    ): Promise<boolean> {
+        // Always respond if directly mentioned
+        if (this._isMessageForMe(message)) return true;
+
+        // If we're not the current handler, don't respond
+        if (channelState?.currentHandler !== this.client.user?.id) return false;
+
+        // Check if we have messages to compare
+        if (!channelState.messages?.length) return false;
+
+        // Get last user message (not from the bot)
+        const lastUserMessage = [...channelState.messages].reverse().find(
+            (m, index) =>
+                index > 0 && // Skip first message (current)
+                m.userId !== this.runtime.agentId
+        );
+
+        if (!lastUserMessage) return false;
+
+        const lastSelfMemories = await this.runtime.messageManager.getMemories({
+            roomId: stringToUuid(
+                message.channel.id + "-" + this.runtime.agentId
+            ),
+            unique: false,
+            count: 5,
+        });
+
+        const lastSelfSortedMemories = lastSelfMemories
+            ?.filter((m) => m.userId === this.runtime.agentId)
+            .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        // Calculate context similarity
+        const contextSimilarity = await this._analyzeContextSimilarity(
+            message.content,
+            {
+                content: lastUserMessage.content.text || "",
+                timestamp: Date.now(),
+            },
+            lastSelfSortedMemories?.[0]?.content?.text
+        );
+
+        const similarityThreshold =
+            this.runtime.character.clientConfig?.discord
+                ?.messageSimilarityThreshold ||
+            channelState.contextSimilarityThreshold ||
+            MESSAGE_CONSTANTS.DEFAULT_SIMILARITY_THRESHOLD;
+
+        return contextSimilarity >= similarityThreshold;
+    }
+
+    private _checkInterest(channelId: string): boolean {
+        const channelState = this.interestChannels[channelId];
+        if (!channelState) return false;
+
+        const lastMessage =
+            channelState.messages[channelState.messages.length - 1];
+        // If it's been more than 5 minutes since last message, reduce interest
+        const timeSinceLastMessage = Date.now() - channelState.lastMessageSent;
+
+        if (timeSinceLastMessage > MESSAGE_CONSTANTS.INTEREST_DECAY_TIME) {
+            delete this.interestChannels[channelId];
+            return false;
+        } else if (
+            timeSinceLastMessage > MESSAGE_CONSTANTS.PARTIAL_INTEREST_DECAY
+        ) {
+            // Require stronger relevance for continued interest
+            return this._isRelevantToTeamMember(
+                lastMessage.content.text || "",
+                channelId
+            );
+        }
+
+        // If team leader and messages exist, check for topic changes and team member responses
+        if (this._isTeamLeader() && channelState.messages.length > 0) {
+            // If leader's keywords don't match and another team member has responded, drop interest
+            if (
+                !this._isRelevantToTeamMember(
+                    lastMessage.content.text || "",
+                    channelId
+                )
+            ) {
+                const recentTeamResponses = channelState.messages
+                    .slice(-3)
+                    .some(
+                        (m) =>
+                            m.userId !== this.client.user?.id &&
+                            this._isTeamMember(m.userId)
+                    );
+
+                if (recentTeamResponses) {
+                    delete this.interestChannels[channelId];
+                    return false;
+                }
+            }
+        }
+
+        // Check if conversation has shifted to a new topic
+        if (channelState.messages.length > 0) {
+            const recentMessages = channelState.messages.slice(
+                -MESSAGE_CONSTANTS.RECENT_MESSAGE_COUNT
+            );
+            const differentUsers = new Set(recentMessages.map((m) => m.userId))
+                .size;
+
+            // If multiple users are talking and we're not involved, reduce interest
+            if (
+                differentUsers > 1 &&
+                !recentMessages.some((m) => m.userId === this.client.user?.id)
+            ) {
+                delete this.interestChannels[channelId];
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private async _shouldIgnore(message: DiscordMessage): Promise<boolean> {
+        // if the message is from us, ignore
+        if (message.author.id === this.client.user?.id) return true;
+
+        // Honor mentions-only mode
+        if (
+            this.runtime.character.clientConfig?.discord
+                ?.shouldRespondOnlyToMentions
+        ) {
+            return !this._isMessageForMe(message);
+        }
+
+        // Team-based ignore logic
+        if (this.runtime.character.clientConfig?.discord?.isPartOfTeam) {
+            const authorId = this._getNormalizedUserId(message.author.id);
+
+            if (this._isTeamLeader()) {
+                if (this._isTeamCoordinationRequest(message.content)) {
+                    return false;
+                }
+                // Ignore if message is only about team member interests and not directed to leader
+                if (!this._isMessageForMe(message)) {
+                    const otherMemberInterests =
+                        this.runtime.character.clientConfig?.discord
+                            ?.teamMemberInterestKeywords || [];
+                    const hasOtherInterests = otherMemberInterests.some(
+                        (keyword) =>
+                            message.content
+                                .toLowerCase()
+                                .includes(keyword.toLowerCase())
+                    );
+                    if (hasOtherInterests) {
+                        return true;
+                    }
+                }
+            } else if (this._isTeamCoordinationRequest(message.content)) {
+                const randomDelay =
+                    Math.floor(
+                        Math.random() *
+                            (TIMING_CONSTANTS.TEAM_MEMBER_DELAY_MAX -
+                                TIMING_CONSTANTS.TEAM_MEMBER_DELAY_MIN)
+                    ) + TIMING_CONSTANTS.TEAM_MEMBER_DELAY_MIN; // 1-3 second random delay
+                await new Promise((resolve) =>
+                    setTimeout(resolve, randomDelay)
+                );
+                return false;
+            }
+
+            if (this._isTeamMember(authorId)) {
+                if (!this._isMessageForMe(message)) {
+                    // If message contains our interests, don't ignore
+                    if (
+                        this._isRelevantToTeamMember(
+                            message.content,
+                            message.channelId
+                        )
+                    ) {
+                        return false;
+                    }
+                    return true;
+                }
+            }
+
+            // Check if we're in an active conversation based on context
+            const channelState = this.interestChannels[message.channelId];
+
+            if (channelState?.currentHandler) {
+                // If we're the current handler, check context
+                if (channelState.currentHandler === this.client.user?.id) {
+                    //If it's our keywords, bypass context check
+                    if (
+                        this._isRelevantToTeamMember(
+                            message.content,
+                            message.channelId
+                        )
+                    ) {
+                        return false;
+                    }
+
+                    const shouldRespondContext =
+                        await this._shouldRespondBasedOnContext(
+                            message,
+                            channelState
+                        );
+
+                    // If context is different, ignore. If similar, don't ignore
+                    return !shouldRespondContext;
+                }
+
+                // If another team member is handling and we're not mentioned or coordinating
+                else if (
+                    !this._isMessageForMe(message) &&
+                    !this._isTeamCoordinationRequest(message.content)
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        let messageContent = message.content.toLowerCase();
+
+        // Replace the bot's @ping with the character name
+        const botMention = `<@!?${this.client.user?.id}>`;
+        messageContent = messageContent.replace(
+            new RegExp(botMention, "gi"),
+            this.runtime.character.name.toLowerCase()
+        );
+
+        // Replace the bot's username with the character name
+        const botUsername = this.client.user?.username.toLowerCase();
+        messageContent = messageContent.replace(
+            new RegExp(`\\b${botUsername}\\b`, "g"),
+            this.runtime.character.name.toLowerCase()
+        );
+
+        // strip all special characters
+        messageContent = messageContent.replace(/[^a-zA-Z0-9\s]/g, "");
+
+        // short responses where eliza should stop talking and disengage unless mentioned again
+        if (
+            messageContent.length < MESSAGE_LENGTH_THRESHOLDS.LOSE_INTEREST &&
+            LOSE_INTEREST_WORDS.some((word) => messageContent.includes(word))
+        ) {
+            delete this.interestChannels[message.channelId];
+            return true;
+        }
+
+        // If we're not interested in the channel and it's a short message, ignore it
+        if (
+            messageContent.length < MESSAGE_LENGTH_THRESHOLDS.SHORT_MESSAGE &&
+            !this.interestChannels[message.channelId]
+        ) {
+            return true;
+        }
+
+        const targetedPhrases = [
+            this.runtime.character.name + " stop responding",
+            this.runtime.character.name + " stop talking",
+            this.runtime.character.name + " shut up",
+            this.runtime.character.name + " stfu",
+            "stop talking" + this.runtime.character.name,
+            this.runtime.character.name + " stop talking",
+            "shut up " + this.runtime.character.name,
+            this.runtime.character.name + " shut up",
+            "stfu " + this.runtime.character.name,
+            this.runtime.character.name + " stfu",
+            "chill" + this.runtime.character.name,
+            this.runtime.character.name + " chill",
+        ];
+
+        // lose interest if pinged and told to stop responding
+        if (targetedPhrases.some((phrase) => messageContent.includes(phrase))) {
+            delete this.interestChannels[message.channelId];
+            return true;
+        }
+
+        // if the message is short, ignore but maintain interest
+        if (
+            !this.interestChannels[message.channelId] &&
+            messageContent.length < MESSAGE_LENGTH_THRESHOLDS.VERY_SHORT_MESSAGE
+        ) {
+            return true;
+        }
+
+        if (
+            message.content.length <
+                MESSAGE_LENGTH_THRESHOLDS.IGNORE_RESPONSE &&
+            IGNORE_RESPONSE_WORDS.some((word) =>
+                message.content.toLowerCase().includes(word)
+            )
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    private async _shouldRespond(
+        message: DiscordMessage,
+        state: State
+    ): Promise<boolean> {
+        if (message.author.id === this.client.user?.id) return false;
+        // if (message.author.bot) return false;
+
+        // Honor mentions-only mode
+        if (
+            this.runtime.character.clientConfig?.discord
+                ?.shouldRespondOnlyToMentions
+        ) {
+            return this._isMessageForMe(message);
+        }
+
+        const channelState = this.interestChannels[message.channelId];
+
+        // Check if team member has direct interest first
+        if (
+            this.runtime.character.clientConfig?.discord?.isPartOfTeam &&
+            !this._isTeamLeader() &&
+            this._isRelevantToTeamMember(message.content, message.channelId)
+        ) {
+            return true;
+        }
+
+        try {
+            // Team-based response logic
+            if (this.runtime.character.clientConfig?.discord?.isPartOfTeam) {
+                // Team leader coordination
+                if (
+                    this._isTeamLeader() &&
+                    this._isTeamCoordinationRequest(message.content)
+                ) {
+                    return true;
+                }
+
+                if (
+                    !this._isTeamLeader() &&
+                    this._isRelevantToTeamMember(
+                        message.content,
+                        message.channelId
+                    )
+                ) {
+                    // Add small delay for non-leader responses
+                    await new Promise((resolve) =>
+                        setTimeout(resolve, TIMING_CONSTANTS.TEAM_MEMBER_DELAY)
+                    ); //1.5 second delay
+
+                    // If leader has responded in last few seconds, reduce chance of responding
+
+                    if (channelState?.messages?.length) {
+                        const recentMessages = channelState.messages.slice(
+                            -MESSAGE_CONSTANTS.RECENT_MESSAGE_COUNT
+                        );
+                        const leaderResponded = recentMessages.some(
+                            (m) =>
+                                m.userId ===
+                                    this.runtime.character.clientConfig?.discord
+                                        ?.teamLeaderId &&
+                                Date.now() - channelState.lastMessageSent < 3000
+                        );
+
+                        if (leaderResponded) {
+                            // 50% chance to respond if leader just did
+                            return (
+                                Math.random() > RESPONSE_CHANCES.AFTER_LEADER
+                            );
+                        }
+                    }
+
+                    return true;
+                }
+
+                // If I'm the leader but message doesn't match my keywords, add delay and check for team responses
+                if (
+                    this._isTeamLeader() &&
+                    !this._isRelevantToTeamMember(
+                        message.content,
+                        message.channelId
+                    )
+                ) {
+                    const randomDelay =
+                        Math.floor(
+                            Math.random() *
+                                (TIMING_CONSTANTS.LEADER_DELAY_MAX -
+                                    TIMING_CONSTANTS.LEADER_DELAY_MIN)
+                        ) + TIMING_CONSTANTS.LEADER_DELAY_MIN; // 2-4 second random delay
+                    await new Promise((resolve) =>
+                        setTimeout(resolve, randomDelay)
+                    );
+
+                    // After delay, check if another team member has already responded
+                    if (channelState?.messages?.length) {
+                        const recentResponses = channelState.messages.slice(
+                            -MESSAGE_CONSTANTS.RECENT_MESSAGE_COUNT
+                        );
+                        const otherTeamMemberResponded = recentResponses.some(
+                            (m) =>
+                                m.userId !== this.client.user?.id &&
+                                this._isTeamMember(m.userId)
+                        );
+
+                        if (otherTeamMemberResponded) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Update current handler if we're mentioned
+                if (this._isMessageForMe(message)) {
+                    const channelState =
+                        this.interestChannels[message.channelId];
+                    if (channelState) {
+                        channelState.currentHandler = this.client.user?.id;
+                        channelState.lastMessageSent = Date.now();
+                    }
+                    return true;
+                }
+
+                // Don't respond if another teammate is handling the conversation
+                if (channelState?.currentHandler) {
+                    if (
+                        channelState.currentHandler !== this.client.user?.id &&
+                        this._isTeamMember(channelState.currentHandler)
+                    ) {
+                        return false;
+                    }
+                }
+
+                // Natural conversation cadence
+                if (!this._isMessageForMe(message) && channelState) {
+                    // Count our recent messages
+                    const recentMessages = channelState.messages.slice(
+                        -MESSAGE_CONSTANTS.CHAT_HISTORY_COUNT
+                    );
+                    const ourMessageCount = recentMessages.filter(
+                        (m) => m.userId === this.client.user?.id
+                    ).length;
+
+                    // Reduce responses if we've been talking a lot
+                    if (ourMessageCount > 2) {
+                        // Exponentially decrease chance to respond
+                        const responseChance = Math.pow(
+                            0.5,
+                            ourMessageCount - 2
+                        );
+                        if (Math.random() > responseChance) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            elizaLogger.error("Error in _shouldRespond team processing:", {
+                error,
+                agentId: this.runtime.agentId,
+                channelId: message.channelId,
+            });
+        }
+
+        // Otherwise do context check
+        if (channelState?.previousContext) {
+            const shouldRespondContext =
+                await this._shouldRespondBasedOnContext(message, channelState);
+            if (!shouldRespondContext) {
+                delete this.interestChannels[message.channelId];
+                return false;
+            }
+        }
+
+        if (message.mentions.has(this.client.user?.id as string)) return true;
+
+        const guild = message.guild;
+        const member = guild?.members.cache.get(this.client.user?.id as string);
+        const nickname = member?.nickname;
+
+        if (
+            message.content
+                .toLowerCase()
+                .includes(this.client.user?.username.toLowerCase() as string) ||
+            message.content
+                .toLowerCase()
+                .includes(this.client.user?.tag.toLowerCase() as string) ||
+            (nickname &&
+                message.content.toLowerCase().includes(nickname.toLowerCase()))
+        ) {
+            return true;
+        }
+
+        if (!message.guild) {
+            return true;
+        }
+
+        // If none of the above conditions are met, use the generateText to decide
+        const shouldRespondContext = composeContext({
+            state,
+            template:
+                this.runtime.character.templates
+                    ?.discordShouldRespondTemplate ||
+                this.runtime.character.templates?.shouldRespondTemplate ||
+                composeRandomUser(discordShouldRespondTemplate, 2),
+        });
+
+        const response = await generateShouldRespond({
+            runtime: this.runtime,
+            context: shouldRespondContext,
+            modelClass: ModelClass.SMALL,
+        });
+
+        if (response === "RESPOND") {
+            if (channelState) {
+                channelState.previousContext = {
+                    content: message.content,
+                    timestamp: Date.now(),
+                };
+            }
+
+            return true;
+        } else if (response === "IGNORE") {
+            return false;
+        } else if (response === "STOP") {
+            delete this.interestChannels[message.channelId];
+            return false;
+        } else {
+            console.error(
+                "Invalid response from response generateText:",
+                response
+            );
+            return false;
+        }
+    }
+
+    private async _generateResponse(
+        message: Memory,
+        state: State,
+        context: string
+    ): Promise<Content> {
+        const { userId, roomId } = message;
+
+        const response = await generateMessageResponse({
+            runtime: this.runtime,
+            context,
+            modelClass: ModelClass.LARGE,
+        });
+
+        if (!response) {
+            console.error("No response from generateMessageResponse");
+            return;
+        }
+
+        await this.runtime.databaseAdapter.log({
+            body: { message, context, response },
+            userId: userId,
+            roomId,
+            type: "response",
+        });
+
+        return response;
+    }
+
+    async fetchBotName(botToken: string) {
+        const url = "https://discord.com/api/v10/users/@me";
+
+        const response = await fetch(url, {
+            method: "GET",
+            headers: {
+                Authorization: `Bot ${botToken}`,
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(
+                `Error fetching bot details: ${response.statusText}`
+            );
+        }
+
+        const data = await response.json();
+        return data.username;
+    }
+
+    /**
+     * Simulate discord typing while generating a response;
+     * returns a function to interrupt the typing loop
+     *
+     * @param message
+     */
+    private simulateTyping(message: DiscordMessage) {
+        let typing = true;
+
+        const typingLoop = async () => {
+            while (typing) {
+                await message.channel.sendTyping();
+                await new Promise((resolve) => setTimeout(resolve, 3000));
+            }
+        };
+
+        typingLoop();
+
+        return function stopTyping() {
+            typing = false;
+        };
+    }
+}
+
+```
+
+`/root/eliza_new/packages/client-discord/src/constants.ts`:
+
+```ts
+export const TEAM_COORDINATION = {
+    KEYWORDS: [
+        'team',
+        'everyone',
+        'all agents',
+        'team update',
+        'gm team',
+        'hello team',
+        'hey team',
+        'hi team',
+        'morning team',
+        'evening team',
+        'night team',
+        'update team',
+    ]
+} as const;
+
+export const MESSAGE_CONSTANTS = {
+    MAX_MESSAGES: 10,
+    RECENT_MESSAGE_COUNT: 3,
+    CHAT_HISTORY_COUNT: 5,
+    INTEREST_DECAY_TIME: 5 * 60 * 1000, // 5 minutes
+    PARTIAL_INTEREST_DECAY: 3 * 60 * 1000, // 3 minutes
+    DEFAULT_SIMILARITY_THRESHOLD: 0.3,
+    DEFAULT_SIMILARITY_THRESHOLD_FOLLOW_UPS: 0.20,
+} as const;
+
+export const MESSAGE_LENGTH_THRESHOLDS = {
+    LOSE_INTEREST: 100,
+    SHORT_MESSAGE: 10,
+    VERY_SHORT_MESSAGE: 2,
+    IGNORE_RESPONSE: 4,
+} as const;
+
+export const TIMING_CONSTANTS = {
+    LEADER_RESPONSE_TIMEOUT: 3000,
+    TEAM_MEMBER_DELAY: 1500,
+    LEADER_DELAY_MIN: 3000,
+    LEADER_DELAY_MAX: 4000,
+    TEAM_MEMBER_DELAY_MIN: 1000,
+    TEAM_MEMBER_DELAY_MAX: 3000,
+} as const;
+
+export const RESPONSE_CHANCES = {
+    AFTER_LEADER: 0.5, // 50% chance
+    FREQUENT_CHATTER: 0.5, // Base chance for frequent responders
+} as const;
+
+export const LOSE_INTEREST_WORDS = [
+    "shut up",
+    "stop",
+    "please shut up",
+    "shut up please",
+    "dont talk",
+    "silence",
+    "stop talking",
+    "be quiet",
+    "hush",
+    "wtf",
+    "chill",
+    "stfu",
+    "stupid bot",
+    "dumb bot",
+    "stop responding",
+    "god damn it",
+    "god damn",
+    "goddamnit",
+    "can you not",
+    "can you stop",
+    "be quiet",
+    "hate you",
+    "hate this",
+    "fuck up",
+] as const;
+
+export const IGNORE_RESPONSE_WORDS = [
+    "lol",
+    "nm",
+    "uh",
+    "wtf",
+    "stfu",
+    "dumb",
+    "jfc",
+    "omg",
+] as const;
+```
+
+`/root/eliza_new/packages/client-discord/src/templates.ts`:
+
+```ts
+import { messageCompletionFooter, shouldRespondFooter } from "@elizaos/core";
+
+export const discordShouldRespondTemplate =
+    `# Task: Decide if {{agentName}} should respond.
+About {{agentName}}:
+{{bio}}
+
+# INSTRUCTIONS: Determine if {{agentName}} should respond to the message and participate in the conversation. Do not comment. Just respond with "RESPOND" or "IGNORE" or "STOP".
+
+# RESPONSE EXAMPLES
+{{user1}}: I just saw a really great movie
+{{user2}}: Oh? Which movie?
+Result: [IGNORE]
+
+{{agentName}}: Oh, this is my favorite scene
+{{user1}}: sick
+{{user2}}: wait, why is it your favorite scene
+Result: [RESPOND]
+
+{{user1}}: stfu bot
+Result: [STOP]
+
+{{user1}}: Hey {{agent}}, can you help me with something
+Result: [RESPOND]
+
+{{user1}}: {{agentName}} stfu plz
+Result: [STOP]
+
+{{user1}}: i need help
+{{agentName}}: how can I help you?
+{{user1}}: no. i need help from someone else
+Result: [IGNORE]
+
+{{user1}}: Hey {{agent}}, can I ask you a question
+{{agentName}}: Sure, what is it
+{{user1}}: can you ask claude to create a basic react module that demonstrates a counter
+Result: [RESPOND]
+
+{{user1}}: {{agentName}} can you tell me a story
+{{user1}}: about a girl named elara
+{{agentName}}: Sure.
+{{agentName}}: Once upon a time, in a quaint little village, there was a curious girl named Elara.
+{{agentName}}: Elara was known for her adventurous spirit and her knack for finding beauty in the mundane.
+{{user1}}: I'm loving it, keep going
+Result: [RESPOND]
+
+{{user1}}: {{agentName}} stop responding plz
+Result: [STOP]
+
+{{user1}}: okay, i want to test something. can you say marco?
+{{agentName}}: marco
+{{user1}}: great. okay, now do it again
+Result: [RESPOND]
+
+Response options are [RESPOND], [IGNORE] and [STOP].
+
+{{agentName}} is in a room with other users and is very worried about being annoying and saying too much.
+Respond with [RESPOND] to messages that are directed at {{agentName}}, or participate in conversations that are interesting or relevant to their background.
+If a message is not interesting or relevant, respond with [IGNORE]
+Unless directly responding to a user, respond with [IGNORE] to messages that are very short or do not contain much information.
+If a user asks {{agentName}} to be quiet, respond with [STOP]
+If {{agentName}} concludes a conversation and isn't part of the conversation anymore, respond with [STOP]
+
+IMPORTANT: {{agentName}} is particularly sensitive about being annoying, so if there is any doubt, it is better to respond with [IGNORE].
+If {{agentName}} is conversing with a user and they have not asked to stop, it is better to respond with [RESPOND].
+
+{{recentMessages}}
+
+# INSTRUCTIONS: Choose the option that best describes {{agentName}}'s response to the last message. Ignore messages if they are addressed to someone else.
+` + shouldRespondFooter;
+
+export const discordVoiceHandlerTemplate =
+    `# Task: Generate conversational voice dialog for {{agentName}}.
+About {{agentName}}:
+{{bio}}
+
+# Attachments
+{{attachments}}
+
+# Capabilities
+Note that {{agentName}} is capable of reading/seeing/hearing various forms of media, including images, videos, audio, plaintext and PDFs. Recent attachments have been included above under the "Attachments" section.
+
+{{actions}}
+
+{{messageDirections}}
+
+{{recentMessages}}
+
+# Instructions: Write the next message for {{agentName}}. Include an optional action if appropriate. {{actionNames}}
+` + messageCompletionFooter;
+
+export const discordMessageHandlerTemplate =
+    // {{goals}}
+    `# Action Examples
+{{actionExamples}}
+(Action examples are for reference only. Do not use the information from them in your response.)
+
+# Knowledge
+{{knowledge}}
+
+# Task: Generate dialog and actions for the character {{agentName}}.
+About {{agentName}}:
+{{bio}}
+{{lore}}
+
+Examples of {{agentName}}'s dialog and actions:
+{{characterMessageExamples}}
+
+{{providers}}
+
+{{attachments}}
+
+{{actions}}
+
+# Capabilities
+Note that {{agentName}} is capable of reading/seeing/hearing various forms of media, including images, videos, audio, plaintext and PDFs. Recent attachments have been included above under the "Attachments" section.
+
+{{messageDirections}}
+
+{{recentMessages}}
+
+# Instructions: Write the next message for {{agentName}}. Include an action, if appropriate. {{actionNames}}
+` + messageCompletionFooter;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/environment.ts`:
+
+```ts
+import { IAgentRuntime } from "@elizaos/core";
+import { z } from "zod";
+
+export const discordEnvSchema = z.object({
+    DISCORD_APPLICATION_ID: z
+        .string()
+        .min(1, "Discord application ID is required"),
+    DISCORD_API_TOKEN: z.string().min(1, "Discord API token is required"),
+});
+
+export type DiscordConfig = z.infer<typeof discordEnvSchema>;
+
+export async function validateDiscordConfig(
+    runtime: IAgentRuntime
+): Promise<DiscordConfig> {
+    try {
+        const config = {
+            DISCORD_APPLICATION_ID:
+                runtime.getSetting("DISCORD_APPLICATION_ID") ||
+                process.env.DISCORD_APPLICATION_ID,
+            DISCORD_API_TOKEN:
+                runtime.getSetting("DISCORD_API_TOKEN") ||
+                process.env.DISCORD_API_TOKEN,
+        };
+
+        return discordEnvSchema.parse(config);
+    } catch (error) {
+        if (error instanceof z.ZodError) {
+            const errorMessages = error.errors
+                .map((err) => `${err.path.join(".")}: ${err.message}`)
+                .join("\n");
+            throw new Error(
+                `Discord configuration validation failed:\n${errorMessages}`
+            );
+        }
+        throw error;
+    }
+}
+
+```
+
+`/root/eliza_new/packages/client-discord/src/actions/chat_with_attachments.ts`:
+
+```ts
+import { composeContext } from "@elizaos/core";
+import { generateText, trimTokens } from "@elizaos/core";
+import { models } from "@elizaos/core";
+import { parseJSONObjectFromText } from "@elizaos/core";
+import {
+    Action,
+    ActionExample,
+    Content,
+    HandlerCallback,
+    IAgentRuntime,
+    Memory,
+    ModelClass,
+    State,
+} from "@elizaos/core";
+import * as fs from "fs";
+
+export const summarizationTemplate = `# Summarized so far (we are adding to this)
+{{currentSummary}}
+
+# Current attachments we are summarizing
+{{attachmentsWithText}}
+
+Summarization objective: {{objective}}
+
+# Instructions: Summarize the attachments. Return the summary. Do not acknowledge this request, just summarize and continue the existing summary if there is one. Capture any important details based on the objective. Only respond with the new summary text.`;
+
+export const attachmentIdsTemplate = `# Messages we are summarizing
+{{recentMessages}}
+
+# Instructions: {{senderName}} is requesting a summary of specific attachments. Your goal is to determine their objective, along with the list of attachment IDs to summarize.
+The "objective" is a detailed description of what the user wants to summarize based on the conversation.
+The "attachmentIds" is an array of attachment IDs that the user wants to summarize. If not specified, default to including all attachments from the conversation.
+
+Your response must be formatted as a JSON block with this structure:
+\`\`\`json
+{
+  "objective": "<What the user wants to summarize>",
+  "attachmentIds": ["<Attachment ID 1>", "<Attachment ID 2>", ...]
+}
+\`\`\`
+`;
+
+const getAttachmentIds = async (
+    runtime: IAgentRuntime,
+    message: Memory,
+    state: State
+): Promise<{ objective: string; attachmentIds: string[] } | null> => {
+    state = (await runtime.composeState(message)) as State;
+
+    const context = composeContext({
+        state,
+        template: attachmentIdsTemplate,
+    });
+
+    for (let i = 0; i < 5; i++) {
+        const response = await generateText({
+            runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+        });
+        console.log("response", response);
+        // try parsing to a json object
+        const parsedResponse = parseJSONObjectFromText(response) as {
+            objective: string;
+            attachmentIds: string[];
+        } | null;
+        // see if it contains objective and attachmentIds
+        if (parsedResponse?.objective && parsedResponse?.attachmentIds) {
+            return parsedResponse;
+        }
+    }
+    return null;
+};
+
+const summarizeAction = {
+    name: "CHAT_WITH_ATTACHMENTS",
+    similes: [
+        "CHAT_WITH_ATTACHMENT",
+        "SUMMARIZE_FILES",
+        "SUMMARIZE_FILE",
+        "SUMMARIZE_ATACHMENT",
+        "CHAT_WITH_PDF",
+        "ATTACHMENT_SUMMARY",
+        "RECAP_ATTACHMENTS",
+        "SUMMARIZE_FILE",
+        "SUMMARIZE_VIDEO",
+        "SUMMARIZE_AUDIO",
+        "SUMMARIZE_IMAGE",
+        "SUMMARIZE_DOCUMENT",
+        "SUMMARIZE_LINK",
+        "ATTACHMENT_SUMMARY",
+        "FILE_SUMMARY",
+    ],
+    description:
+        "Answer a user request informed by specific attachments based on their IDs. If a user asks to chat with a PDF, or wants more specific information about a link or video or anything else they've attached, this is the action to use.",
+    validate: async (
+        _runtime: IAgentRuntime,
+        message: Memory,
+        _state: State
+    ) => {
+        if (message.content.source !== "discord") {
+            return false;
+        }
+        // only show if one of the keywords are in the message
+        const keywords: string[] = [
+            "attachment",
+            "summary",
+            "summarize",
+            "research",
+            "pdf",
+            "video",
+            "audio",
+            "image",
+            "document",
+            "link",
+            "file",
+            "attachment",
+            "summarize",
+            "code",
+            "report",
+            "write",
+            "details",
+            "information",
+            "talk",
+            "chat",
+            "read",
+            "listen",
+            "watch",
+        ];
+        return keywords.some((keyword) =>
+            message.content.text.toLowerCase().includes(keyword.toLowerCase())
+        );
+    },
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state: State,
+        options: any,
+        callback: HandlerCallback
+    ) => {
+        state = (await runtime.composeState(message)) as State;
+
+        const callbackData: Content = {
+            text: "", // fill in later
+            action: "CHAT_WITH_ATTACHMENTS_RESPONSE",
+            source: message.content.source,
+            attachments: [],
+        };
+
+        // 1. extract attachment IDs from the message
+        const attachmentData = await getAttachmentIds(runtime, message, state);
+        if (!attachmentData) {
+            console.error("Couldn't get attachment IDs from message");
+            return;
+        }
+
+        const { objective, attachmentIds } = attachmentData;
+
+        // This is pretty gross but it can catch cases where the returned generated UUID is stupidly wrong for some reason
+        const attachments = state.recentMessagesData
+            .filter(
+                (msg) =>
+                    msg.content.attachments &&
+                    msg.content.attachments.length > 0
+            )
+            .flatMap((msg) => msg.content.attachments)
+            // check by first 5 characters of uuid
+            .filter(
+                (attachment) =>
+                    attachmentIds
+                        .map((attch) => attch.toLowerCase().slice(0, 5))
+                        .includes(attachment.id.toLowerCase().slice(0, 5)) ||
+                    // or check the other way
+                    attachmentIds.some((id) => {
+                        const attachmentId = id.toLowerCase().slice(0, 5);
+                        return attachment.id
+                            .toLowerCase()
+                            .includes(attachmentId);
+                    })
+            );
+
+        const attachmentsWithText = attachments
+            .map((attachment) => `# ${attachment.title}\n${attachment.text}`)
+            .join("\n\n");
+
+        let currentSummary = "";
+
+        const model = models[runtime.character.modelProvider];
+        const chunkSize = model.settings.maxOutputTokens;
+
+        state.attachmentsWithText = attachmentsWithText;
+        state.objective = objective;
+        const template = await trimTokens(
+            summarizationTemplate,
+            chunkSize + 500,
+            runtime
+        );
+        const context = composeContext({
+            state,
+            // make sure it fits, we can pad the tokens a bit
+            // Get the model's tokenizer based on the current model being used
+            template,
+        });
+
+        const summary = await generateText({
+            runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+        });
+
+        currentSummary = currentSummary + "\n" + summary;
+
+        if (!currentSummary) {
+            console.error("No summary found, that's not good!");
+            return;
+        }
+
+        callbackData.text = currentSummary.trim();
+        if (
+            callbackData.text &&
+            (currentSummary.trim()?.split("\n").length < 4 ||
+                currentSummary.trim()?.split(" ").length < 100)
+        ) {
+            callbackData.text = `Here is the summary:
+\`\`\`md
+${currentSummary.trim()}
+\`\`\`
+`;
+            await callback(callbackData);
+        } else if (currentSummary.trim()) {
+            const summaryFilename = `content/summary_${Date.now()}.md`;
+
+            try {
+                // Debug: Log before file operations
+                console.log("Creating summary file:", {
+                    filename: summaryFilename,
+                    summaryLength: currentSummary.length,
+                });
+
+                // Write file directly first
+                await fs.promises.writeFile(
+                    summaryFilename,
+                    currentSummary,
+                    "utf8"
+                );
+                console.log("File written successfully");
+
+                // Then cache it
+                await runtime.cacheManager.set(summaryFilename, currentSummary);
+                console.log("Cache set operation completed");
+
+                await callback(
+                    {
+                        ...callbackData,
+                        text: `I've attached the summary of the requested attachments as a text file.`,
+                    },
+                    [summaryFilename]
+                );
+                console.log("Callback completed with summary file");
+            } catch (error) {
+                console.error("Error in file/cache process:", error);
+                throw error;
+            }
+        } else {
+            console.warn(
+                "Empty response from chat with attachments action, skipping"
+            );
+        }
+
+        return callbackData;
+    },
+    examples: [
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Can you summarize the attachments b3e23, c4f67, and d5a89?",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sure thing! I'll pull up those specific attachments and provide a summary of their content.",
+                    action: "CHAT_WITH_ATTACHMENTS",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "I need a technical summary of the PDFs I sent earlier - a1b2c3.pdf, d4e5f6.pdf, and g7h8i9.pdf",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "I'll take a look at those specific PDF attachments and put together a technical summary for you. Give me a few minutes to review them.",
+                    action: "CHAT_WITH_ATTACHMENTS",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Can you watch this video for me and tell me which parts you think are most relevant to the report I'm writing? (the one I attached in my last message)",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "sure, no problem.",
+                    action: "CHAT_WITH_ATTACHMENTS",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "can you read my blog post and give me a detailed breakdown of the key points I made, and then suggest a handful of tweets to promote it?",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "great idea, give me a minute",
+                    action: "CHAT_WITH_ATTACHMENTS",
+                },
+            },
+        ],
+    ] as ActionExample[][],
+} as Action;
+
+export default summarizeAction;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/actions/summarize_conversation.ts`:
+
+```ts
+import { composeContext } from "@elizaos/core";
+import { generateText, splitChunks, trimTokens } from "@elizaos/core";
+import { getActorDetails } from "@elizaos/core";
+import { models } from "@elizaos/core";
+import { parseJSONObjectFromText } from "@elizaos/core";
+import {
+    Action,
+    ActionExample,
+    Content,
+    HandlerCallback,
+    IAgentRuntime,
+    Media,
+    Memory,
+    ModelClass,
+    State,
+} from "@elizaos/core";
+export const summarizationTemplate = `# Summarized so far (we are adding to this)
+{{currentSummary}}
+
+# Current conversation chunk we are summarizing (includes attachments)
+{{memoriesWithAttachments}}
+
+Summarization objective: {{objective}}
+
+# Instructions: Summarize the conversation so far. Return the summary. Do not acknowledge this request, just summarize and continue the existing summary if there is one. Capture any important details to the objective. Only respond with the new summary text.
+Your response should be extremely detailed and include any and all relevant information.`;
+
+export const dateRangeTemplate = `# Messages we are summarizing (the conversation is continued after this)
+{{recentMessages}}
+
+# Instructions: {{senderName}} is requesting a summary of the conversation. Your goal is to determine their objective, along with the range of dates that their request covers.
+The "objective" is a detailed description of what the user wants to summarize based on the conversation. If they just ask for a general summary, you can either base it off the converation if the summary range is very recent, or set the object to be general, like "a detailed summary of the conversation between all users".
+The "start" and "end" are the range of dates that the user wants to summarize, relative to the current time. The start and end should be relative to the current time, and measured in seconds, minutes, hours and days. The format is "2 days ago" or "3 hours ago" or "4 minutes ago" or "5 seconds ago", i.e. "<integer> <unit> ago".
+If you aren't sure, you can use a default range of "0 minutes ago" to "2 hours ago" or more. Better to err on the side of including too much than too little.
+
+Your response must be formatted as a JSON block with this structure:
+\`\`\`json
+{
+  "objective": "<What the user wants to summarize>",
+  "start": "0 minutes ago",
+  "end": "2 hours ago"
+}
+\`\`\`
+`;
+
+const getDateRange = async (
+    runtime: IAgentRuntime,
+    message: Memory,
+    state: State
+) => {
+    state = (await runtime.composeState(message)) as State;
+
+    const context = composeContext({
+        state,
+        template: dateRangeTemplate,
+    });
+
+    for (let i = 0; i < 5; i++) {
+        const response = await generateText({
+            runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+        });
+        console.log("response", response);
+        // try parsing to a json object
+        const parsedResponse = parseJSONObjectFromText(response) as {
+            objective: string;
+            start: string | number;
+            end: string | number;
+        } | null;
+        // see if it contains objective, start and end
+        if (parsedResponse) {
+            if (
+                parsedResponse.objective &&
+                parsedResponse.start &&
+                parsedResponse.end
+            ) {
+                // TODO: parse start and end into timestamps
+                const startIntegerString = (
+                    parsedResponse.start as string
+                ).match(/\d+/)?.[0];
+                const endIntegerString = (parsedResponse.end as string).match(
+                    /\d+/
+                )?.[0];
+
+                // parse multiplier
+                const multipliers = {
+                    second: 1 * 1000,
+                    minute: 60 * 1000,
+                    hour: 3600 * 1000,
+                    day: 86400 * 1000,
+                };
+
+                const startMultiplier = (parsedResponse.start as string).match(
+                    /second|minute|hour|day/
+                )?.[0];
+                const endMultiplier = (parsedResponse.end as string).match(
+                    /second|minute|hour|day/
+                )?.[0];
+
+                const startInteger = startIntegerString
+                    ? parseInt(startIntegerString)
+                    : 0;
+                const endInteger = endIntegerString
+                    ? parseInt(endIntegerString)
+                    : 0;
+
+                // multiply by multiplier
+                const startTime =
+                    startInteger *
+                    multipliers[startMultiplier as keyof typeof multipliers];
+
+                console.log("startTime", startTime);
+
+                const endTime =
+                    endInteger *
+                    multipliers[endMultiplier as keyof typeof multipliers];
+
+                console.log("endTime", endTime);
+
+                // get the current time and subtract the start and end times
+                parsedResponse.start = Date.now() - startTime;
+                parsedResponse.end = Date.now() - endTime;
+
+                return parsedResponse;
+            }
+        }
+    }
+};
+
+const summarizeAction = {
+    name: "SUMMARIZE_CONVERSATION",
+    similes: [
+        "RECAP",
+        "RECAP_CONVERSATION",
+        "SUMMARIZE_CHAT",
+        "SUMMARIZATION",
+        "CHAT_SUMMARY",
+        "CONVERSATION_SUMMARY",
+    ],
+    description: "Summarizes the conversation and attachments.",
+    validate: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        _state: State
+    ) => {
+        if (message.content.source !== "discord") {
+            return false;
+        }
+        // only show if one of the keywords are in the message
+        const keywords: string[] = [
+            "summarize",
+            "summarization",
+            "summary",
+            "recap",
+            "report",
+            "overview",
+            "review",
+            "rundown",
+            "wrap-up",
+            "brief",
+            "debrief",
+            "abstract",
+            "synopsis",
+            "outline",
+            "digest",
+            "abridgment",
+            "condensation",
+            "encapsulation",
+            "essence",
+            "gist",
+            "main points",
+            "key points",
+            "key takeaways",
+            "bulletpoint",
+            "highlights",
+            "tldr",
+            "tl;dr",
+            "in a nutshell",
+            "bottom line",
+            "long story short",
+            "sum up",
+            "sum it up",
+            "short version",
+            "bring me up to speed",
+            "catch me up",
+        ];
+        return keywords.some((keyword) =>
+            message.content.text.toLowerCase().includes(keyword.toLowerCase())
+        );
+    },
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state: State,
+        options: any,
+        callback: HandlerCallback
+    ) => {
+        state = (await runtime.composeState(message)) as State;
+
+        const callbackData: Content = {
+            text: "", // fill in later
+            action: "SUMMARIZATION_RESPONSE",
+            source: message.content.source,
+            attachments: [],
+        };
+        const { roomId } = message;
+
+        // 1. extract date range from the message
+        const dateRange = await getDateRange(runtime, message, state);
+        if (!dateRange) {
+            console.error("Couldn't get date range from message");
+            return;
+        }
+
+        console.log("dateRange", dateRange);
+
+        const { objective, start, end } = dateRange;
+
+        // 2. get these memories from the database
+        const memories = await runtime.messageManager.getMemories({
+            roomId,
+            // subtract start from current time
+            start: parseInt(start as string),
+            end: parseInt(end as string),
+            count: 10000,
+            unique: false,
+        });
+
+        const actors = await getActorDetails({
+            runtime: runtime as IAgentRuntime,
+            roomId,
+        });
+
+        const actorMap = new Map(actors.map((actor) => [actor.id, actor]));
+
+        const formattedMemories = memories
+            .map((memory) => {
+                const attachments = memory.content.attachments
+                    ?.map((attachment: Media) => {
+                        return `---\nAttachment: ${attachment.id}\n${attachment.description}\n${attachment.text}\n---`;
+                    })
+                    .join("\n");
+                return `${actorMap.get(memory.userId)?.name ?? "Unknown User"} (${actorMap.get(memory.userId)?.username ?? ""}): ${memory.content.text}\n${attachments}`;
+            })
+            .join("\n");
+
+        let currentSummary = "";
+
+        const model = models[runtime.character.settings.model];
+        const chunkSize = model.settings.maxContextLength - 1000;
+
+        const chunks = await splitChunks(formattedMemories, chunkSize, 0);
+
+        const _datestr = new Date().toUTCString().replace(/:/g, "-");
+
+        state.memoriesWithAttachments = formattedMemories;
+        state.objective = objective;
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            state.currentSummary = currentSummary;
+            state.currentChunk = chunk;
+            const template = await trimTokens(
+                summarizationTemplate,
+                chunkSize + 500,
+                runtime
+            );
+            const context = composeContext({
+                state,
+                // make sure it fits, we can pad the tokens a bit
+                template,
+            });
+
+            const summary = await generateText({
+                runtime,
+                context,
+                modelClass: ModelClass.SMALL,
+            });
+
+            currentSummary = currentSummary + "\n" + summary;
+        }
+
+        if (!currentSummary) {
+            console.error("No summary found, that's not good!");
+            return;
+        }
+
+        callbackData.text = currentSummary.trim();
+        if (
+            callbackData.text &&
+            (currentSummary.trim()?.split("\n").length < 4 ||
+                currentSummary.trim()?.split(" ").length < 100)
+        ) {
+            callbackData.text = `Here is the summary:
+\`\`\`md
+${currentSummary.trim()}
+\`\`\`
+`;
+            await callback(callbackData);
+        } else if (currentSummary.trim()) {
+            const summaryFilename = `content/conversation_summary_${Date.now()}`;
+            await runtime.cacheManager.set(summaryFilename, currentSummary);
+            // save the summary to a file
+            await callback(
+                {
+                    ...callbackData,
+                    text: `I've attached the summary of the conversation from \`${new Date(parseInt(start as string)).toString()}\` to \`${new Date(parseInt(end as string)).toString()}\` as a text file.`,
+                },
+                [summaryFilename]
+            );
+        } else {
+            console.warn(
+                "Empty response from summarize conversation action, skipping"
+            );
+        }
+
+        return callbackData;
+    },
+    examples: [
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "```js\nconst x = 10\n```",
+                },
+            },
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "can you give me a detailed report on what we're talking about?",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "sure, no problem, give me a minute to get that together for you",
+                    action: "SUMMARIZE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "please summarize the conversation we just had and include this blogpost i'm linking (Attachment: b3e12)",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "sure, give me a sec",
+                    action: "SUMMARIZE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Can you summarize what moon and avf are talking about?",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Yeah, just hold on a second while I get that together for you...",
+                    action: "SUMMARIZE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "i need to write a blog post about farming, can you summarize the discussion from a few hours ago?",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "no probblem, give me a few minutes to read through everything",
+                    action: "SUMMARIZE",
+                },
+            },
+        ],
+    ] as ActionExample[][],
+} as Action;
+
+export default summarizeAction;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/actions/transcribe_media.ts`:
+
+```ts
+import { composeContext } from "@elizaos/core";
+import { generateText } from "@elizaos/core";
+import { parseJSONObjectFromText } from "@elizaos/core";
+import {
+    Action,
+    ActionExample,
+    Content,
+    HandlerCallback,
+    IAgentRuntime,
+    Memory,
+    ModelClass,
+    State,
+} from "@elizaos/core";
+
+export const transcriptionTemplate = `# Transcription of media file
+{{mediaTranscript}}
+
+# Instructions: Return only the full transcript of the media file without any additional context or commentary.`;
+
+export const mediaAttachmentIdTemplate = `# Messages we are transcribing
+{{recentMessages}}
+
+# Instructions: {{senderName}} is requesting a transcription of a specific media file (audio or video). Your goal is to determine the ID of the attachment they want transcribed.
+The "attachmentId" is the ID of the media file attachment that the user wants transcribed. If not specified, return null.
+
+Your response must be formatted as a JSON block with this structure:
+\`\`\`json
+{
+  "attachmentId": "<Attachment ID>"
+}
+\`\`\`
+`;
+
+const getMediaAttachmentId = async (
+    runtime: IAgentRuntime,
+    message: Memory,
+    state: State
+): Promise<string | null> => {
+    state = (await runtime.composeState(message)) as State;
+
+    const context = composeContext({
+        state,
+        template: mediaAttachmentIdTemplate,
+    });
+
+    for (let i = 0; i < 5; i++) {
+        const response = await generateText({
+            runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+        });
+        console.log("response", response);
+
+        const parsedResponse = parseJSONObjectFromText(response) as {
+            attachmentId: string;
+        } | null;
+
+        if (parsedResponse?.attachmentId) {
+            return parsedResponse.attachmentId;
+        }
+    }
+    return null;
+};
+
+const transcribeMediaAction = {
+    name: "TRANSCRIBE_MEDIA",
+    similes: [
+        "TRANSCRIBE_AUDIO",
+        "TRANSCRIBE_VIDEO",
+        "MEDIA_TRANSCRIPT",
+        "VIDEO_TRANSCRIPT",
+        "AUDIO_TRANSCRIPT",
+    ],
+    description:
+        "Transcribe the full text of an audio or video file that the user has attached.",
+    validate: async (
+        _runtime: IAgentRuntime,
+        message: Memory,
+        _state: State
+    ) => {
+        if (message.content.source !== "discord") {
+            return false;
+        }
+
+        const keywords: string[] = [
+            "transcribe",
+            "transcript",
+            "audio",
+            "video",
+            "media",
+            "youtube",
+            "meeting",
+            "recording",
+            "podcast",
+            "call",
+            "conference",
+            "interview",
+            "speech",
+            "lecture",
+            "presentation",
+        ];
+        return keywords.some((keyword) =>
+            message.content.text.toLowerCase().includes(keyword.toLowerCase())
+        );
+    },
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state: State,
+        options: any,
+        callback: HandlerCallback
+    ) => {
+        state = (await runtime.composeState(message)) as State;
+
+        const callbackData: Content = {
+            text: "", // fill in later
+            action: "TRANSCRIBE_MEDIA_RESPONSE",
+            source: message.content.source,
+            attachments: [],
+        };
+
+        const attachmentId = await getMediaAttachmentId(
+            runtime,
+            message,
+            state
+        );
+        if (!attachmentId) {
+            console.error("Couldn't get media attachment ID from message");
+            return;
+        }
+
+        const attachment = state.recentMessagesData
+            .filter(
+                (msg) =>
+                    msg.content.attachments &&
+                    msg.content.attachments.length > 0
+            )
+            .flatMap((msg) => msg.content.attachments)
+            .find(
+                (attachment) =>
+                    attachment.id.toLowerCase() === attachmentId.toLowerCase()
+            );
+
+        if (!attachment) {
+            console.error(`Couldn't find attachment with ID ${attachmentId}`);
+            return;
+        }
+
+        const mediaTranscript = attachment.text;
+
+        callbackData.text = mediaTranscript.trim();
+
+        // if callbackData.text is < 4 lines or < 100 words, then we we callback with normal message wrapped in markdown block
+        if (
+            callbackData.text &&
+            (callbackData.text?.split("\n").length < 4 ||
+                callbackData.text?.split(" ").length < 100)
+        ) {
+            callbackData.text = `Here is the transcript:
+\`\`\`md
+${mediaTranscript.trim()}
+\`\`\`
+`;
+            await callback(callbackData);
+        }
+        // if text is big, let's send as an attachment
+        else if (callbackData.text) {
+            const transcriptFilename = `content/transcript_${Date.now()}`;
+
+            // save the transcript to a file
+            await runtime.cacheManager.set(
+                transcriptFilename,
+                callbackData.text
+            );
+
+            await callback(
+                {
+                    ...callbackData,
+                    text: `I've attached the transcript as a text file.`,
+                },
+                [transcriptFilename]
+            );
+        } else {
+            console.warn(
+                "Empty response from transcribe media action, skipping"
+            );
+        }
+
+        return callbackData;
+    },
+    examples: [
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Please transcribe the audio file I just sent.",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sure, I'll transcribe the full audio for you.",
+                    action: "TRANSCRIBE_MEDIA",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Can I get a transcript of that video recording?",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Absolutely, give me a moment to generate the full transcript of the video.",
+                    action: "TRANSCRIBE_MEDIA",
+                },
+            },
+        ],
+    ] as ActionExample[][],
+} as Action;
+
+export default transcribeMediaAction;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/actions/leavevoice.ts`:
+
+```ts
+// src/actions/leaveVoice
+import { getVoiceConnection } from "@discordjs/voice";
+import {
+    Channel,
+    ChannelType,
+    Client,
+    Message as DiscordMessage,
+} from "discord.js";
+import {
+    Action,
+    ActionExample,
+    IAgentRuntime,
+    Memory,
+    State,
+} from "@elizaos/core";
+
+export default {
+    name: "LEAVE_VOICE",
+    similes: [
+        "LEAVE_VOICE",
+        "LEAVE_VC",
+        "LEAVE_VOICE_CHAT",
+        "LEAVE_VOICE_CHANNEL",
+        "LEAVE_MEETING",
+        "LEAVE_CALL",
+    ],
+    validate: async (runtime: IAgentRuntime, message: Memory, state: State) => {
+        if (message.content.source !== "discord") {
+            // not a discord message
+            return false;
+        }
+
+        if (!state.discordClient) {
+            return false;
+        }
+
+        const keywords = [
+            "leave",
+            "exit",
+            "stop",
+            "quit",
+            "get off",
+            "get out",
+            "bye",
+            "cya",
+            "see you",
+            "hop off",
+            "get off",
+            "voice",
+            "vc",
+            "chat",
+            "call",
+            "meeting",
+            "discussion",
+        ];
+        if (
+            !keywords.some((keyword) =>
+                message.content.text.toLowerCase().includes(keyword)
+            )
+        ) {
+            return false;
+        }
+
+        const client = state.discordClient as Client;
+
+        // Check if the client is connected to any voice channel
+        const isConnectedToVoice = client.voice.adapters.size > 0;
+
+        return isConnectedToVoice;
+    },
+    description: "Leave the current voice channel.",
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state: State
+    ): Promise<boolean> => {
+        if (!state.discordClient) {
+            return;
+        }
+
+        const discordMessage = (state.discordMessage ||
+            state.discordChannel) as DiscordMessage;
+
+        if (!discordMessage) {
+            throw new Error("Discord message is not available in the state.");
+        }
+        const voiceChannels = (state.discordClient as Client)?.guilds.cache
+            .get((discordMessage as DiscordMessage).guild?.id as string)
+            ?.channels.cache.filter(
+                (channel: Channel) => channel.type === ChannelType.GuildVoice
+            );
+
+        voiceChannels?.forEach((_channel: Channel) => {
+            const connection = getVoiceConnection(
+                (discordMessage as DiscordMessage).guild?.id as string
+            );
+            if (connection) {
+                connection.destroy();
+            }
+        });
+        return true;
+    },
+    examples: [
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Hey {{user2}} please leave the voice channel",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sure",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "I have to go now but thanks for the chat",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "You too, talk to you later",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Great call everyone, hopping off now",
+                    action: "LEAVE_VOICE",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Agreed, I'll hop off too",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Hey {{user2}} I need you to step away from the voice chat for a bit",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "No worries, I'll leave the voice channel",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "{{user2}}, I think we covered everything, you can leave the voice chat now",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sounds good, see you both later",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "leave voice {{user2}}",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "ok leaving",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "plz leave the voice chat {{user2}}",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "aight im out",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "yo {{user2}} gtfo the vc",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "sorry, talk to you later",
+                    action: "LEAVE_VOICE",
+                },
+            },
+        ],
+    ] as ActionExample[][],
+} as Action;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/actions/joinvoice.ts`:
+
+```ts
+// eslint-disable-next-line
+// @ts-nocheck
+// src/actions/joinVoice
+import {
+    Action,
+    ActionExample,
+    composeContext,
+    IAgentRuntime,
+    Memory,
+    State,
+} from "@elizaos/core";
+import {
+    Channel,
+    ChannelType,
+    Client,
+    Message as DiscordMessage,
+    Guild,
+    GuildMember,
+} from "discord.js";
+
+export default {
+    name: "JOIN_VOICE",
+    similes: [
+        "JOIN_VOICE",
+        "JOIN_VC",
+        "JOIN_VOICE_CHAT",
+        "JOIN_VOICE_CHANNEL",
+        "JOIN_MEETING",
+        "JOIN_CALL",
+    ],
+    validate: async (
+        _runtime: IAgentRuntime,
+        message: Memory,
+        state: State
+    ) => {
+        if (message.content.source !== "discord") {
+            // not a discord message
+            return false;
+        }
+
+        if (!state.discordClient) {
+            return;
+        }
+
+        // did they say something about joining a voice channel? if not, don't validate
+        const keywords = [
+            "join",
+            "come to",
+            "come on",
+            "enter",
+            "voice",
+            "chat",
+            "talk",
+            "call",
+            "hop on",
+            "get on",
+            "vc",
+            "meeting",
+            "discussion",
+        ];
+        if (
+            !keywords.some((keyword) =>
+                message.content.text.toLowerCase().includes(keyword)
+            )
+        ) {
+            return false;
+        }
+
+        const client = state.discordClient as Client;
+
+        // Check if the client is connected to any voice channel
+        const isConnectedToVoice = client.voice.adapters.size === 0;
+
+        return isConnectedToVoice;
+    },
+    description: "Join a voice channel to participate in voice chat.",
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state: State
+    ): Promise<boolean> => {
+        if (!state) {
+            console.error("State is not available.");
+        }
+
+        // We normalize data in from voice channels
+        const discordMessage = (state.discordChannel ||
+            state.discordMessage) as DiscordMessage;
+
+        if (!discordMessage.content) {
+            discordMessage.content = message.content.text;
+        }
+
+        const id = (discordMessage as DiscordMessage).guild?.id as string;
+        const client = state.discordClient as Client;
+        const voiceChannels = (
+            client.guilds.cache.get(id) as Guild
+        ).channels.cache.filter(
+            (channel: Channel) => channel.type === ChannelType.GuildVoice
+        );
+
+        const messageContent = discordMessage.content;
+
+        const targetChannel = voiceChannels.find((channel) => {
+            const name = (channel as { name: string }).name.toLowerCase();
+
+            // remove all non-alphanumeric characters (keep spaces between words)
+            const replacedName = name.replace(/[^a-z0-9 ]/g, "");
+
+            return (
+                name.includes(messageContent) ||
+                messageContent.includes(name) ||
+                replacedName.includes(messageContent) ||
+                messageContent.includes(replacedName)
+            );
+        });
+
+        if (!state.voiceManager) {
+            state.voiceManager = new VoiceManager({
+                client: state.discordClient,
+                runtime: runtime,
+            });
+        }
+
+        if (targetChannel) {
+            state.voiceManager.joinVoiceChannel({
+                channelId: targetChannel.id,
+                guildId: (discordMessage as DiscordMessage).guild?.id as string,
+                adapterCreator: (client.guilds.cache.get(id) as Guild)
+                    .voiceAdapterCreator,
+            });
+            return true;
+        } else {
+            const member = (discordMessage as DiscordMessage)
+                .member as GuildMember;
+            if (member?.voice?.channel) {
+                state.voiceManager.joinVoiceChannel({
+                    channelId: member.voice.channel.id,
+                    guildId: (discordMessage as DiscordMessage).guild
+                        ?.id as string,
+                    adapterCreator: (client.guilds.cache.get(id) as Guild)
+                        .voiceAdapterCreator,
+                });
+                return true;
+            }
+
+            const messageTemplate = `
+The user has requested to join a voice channel.
+Here is the list of channels available in the server:
+{{voiceChannels}}
+
+Here is the user's request:
+{{userMessage}}
+
+Please respond with the name of the voice channel which the bot should join. Try to infer what channel the user is talking about. If the user didn't specify a voice channel, respond with "none".
+You should only respond with the name of the voice channel or none, no commentary or additional information should be included.
+`;
+
+            const guessState = {
+                userMessage: message.content.text,
+                voiceChannels: voiceChannels
+                    .map((channel) => (channel as { name: string }).name)
+                    .join("\n"),
+            };
+
+            const context = composeContext({
+                template: messageTemplate,
+                state: guessState as unknown as State,
+            });
+
+            const _datestr = new Date().toUTCString().replace(/:/g, "-");
+
+            const responseContent = await generateText({
+                runtime,
+                context,
+                modelClass: ModelClass.SMALL,
+            });
+
+            runtime.databaseAdapter.log({
+                body: { message, context, response: responseContent },
+                userId: message.userId,
+                roomId: message.roomId,
+                type: "joinvoice",
+            });
+
+            if (responseContent && responseContent.trim().length > 0) {
+                // join the voice channel
+                const channelName = responseContent.toLowerCase();
+
+                const targetChannel = voiceChannels.find((channel) => {
+                    const name = (
+                        channel as { name: string }
+                    ).name.toLowerCase();
+
+                    // remove all non-alphanumeric characters (keep spaces between words)
+                    const replacedName = name.replace(/[^a-z0-9 ]/g, "");
+
+                    return (
+                        name.includes(channelName) ||
+                        channelName.includes(name) ||
+                        replacedName.includes(channelName) ||
+                        channelName.includes(replacedName)
+                    );
+                });
+
+                if (targetChannel) {
+                    state.voiceManager.joinVoiceChannel({
+                        channelId: targetChannel.id,
+                        guildId: (discordMessage as DiscordMessage).guild
+                            ?.id as string,
+                        adapterCreator: (client.guilds.cache.get(id) as Guild)
+                            .voiceAdapterCreator,
+                    });
+                    return true;
+                }
+            }
+
+            await (discordMessage as DiscordMessage).reply(
+                "I couldn't figure out which channel you wanted me to join."
+            );
+            return false;
+        }
+    },
+    examples: [
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Hey, let's jump into the 'General' voice and chat",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sounds good",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "{{user2}}, can you join the vc, I want to discuss our strat",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sure I'll join right now",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "hey {{user2}}, we're having a team meeting in the 'conference' voice channel, plz join us",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "OK see you there",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "{{user2}}, let's have a quick voice chat in the 'Lounge' channel.",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "kk be there in a sec",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Hey {{user2}}, can you join me in the 'Music' voice channel",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sure",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "join voice chat with us {{user2}}",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "coming",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "hop in vc {{user2}}",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "joining now",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "get in vc with us {{user2}}",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "im in",
+                    action: "JOIN_VOICE",
+                },
+            },
+        ],
+    ] as ActionExample[][],
+} as Action;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/actions/download_media.ts`:
+
+```ts
+import path from "path";
+import { composeContext } from "@elizaos/core";
+import { parseJSONObjectFromText } from "@elizaos/core";
+import {
+    Action,
+    ActionExample,
+    Content,
+    HandlerCallback,
+    IAgentRuntime,
+    IVideoService,
+    Memory,
+    ModelClass,
+    ServiceType,
+    State,
+} from "@elizaos/core";
+import { generateText } from "@elizaos/core";
+
+export const mediaUrlTemplate = `# Messages we are searching for a media URL
+{{recentMessages}}
+
+# Instructions: {{senderName}} is requesting to download a specific media file (video or audio). Your goal is to determine the URL of the media they want to download.
+The "mediaUrl" is the URL of the media file that the user wants downloaded. If not specified, return null.
+
+Your response must be formatted as a JSON block with this structure:
+\`\`\`json
+{
+  "mediaUrl": "<Media URL>"
+}
+\`\`\`
+`;
+
+const getMediaUrl = async (
+    runtime: IAgentRuntime,
+    message: Memory,
+    state: State
+): Promise<string | null> => {
+    if (!state) {
+        state = (await runtime.composeState(message)) as State;
+    }
+
+    const context = composeContext({
+        state,
+        template: mediaUrlTemplate,
+    });
+
+    for (let i = 0; i < 5; i++) {
+        const response = await generateText({
+            runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+        });
+
+        const parsedResponse = parseJSONObjectFromText(response) as {
+            mediaUrl: string;
+        } | null;
+
+        if (parsedResponse?.mediaUrl) {
+            return parsedResponse.mediaUrl;
+        }
+    }
+    return null;
+};
+
+export default {
+    name: "DOWNLOAD_MEDIA",
+    similes: [
+        "DOWNLOAD_VIDEO",
+        "DOWNLOAD_AUDIO",
+        "GET_MEDIA",
+        "DOWNLOAD_PODCAST",
+        "DOWNLOAD_YOUTUBE",
+    ],
+    description:
+        "Downloads a video or audio file from a URL and attaches it to the response message.",
+    validate: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        _state: State
+    ) => {
+        if (message.content.source !== "discord") {
+            return false;
+        }
+    },
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        state: State,
+        options: any,
+        callback: HandlerCallback
+    ) => {
+        const videoService = runtime
+            .getService<IVideoService>(ServiceType.VIDEO)
+            .getInstance();
+        if (!state) {
+            state = (await runtime.composeState(message)) as State;
+        }
+
+        const mediaUrl = await getMediaUrl(runtime, message, state);
+        if (!mediaUrl) {
+            console.error("Couldn't get media URL from messages");
+            return;
+        }
+
+        const videoInfo = await videoService.fetchVideoInfo(mediaUrl);
+        const mediaPath = await videoService.downloadVideo(videoInfo);
+
+        const response: Content = {
+            text: `I downloaded the video "${videoInfo.title}" and attached it below.`,
+            action: "DOWNLOAD_MEDIA_RESPONSE",
+            source: message.content.source,
+            attachments: [],
+        };
+
+        const filename = path.basename(mediaPath);
+
+        const maxRetries = 3;
+        let retries = 0;
+
+        while (retries < maxRetries) {
+            try {
+                await callback(
+                    {
+                        ...response,
+                    },
+                    ["content_cache/" + filename]
+                );
+                break;
+            } catch (error) {
+                retries++;
+                console.error(
+                    `Error sending message (attempt ${retries}):`,
+                    error
+                );
+
+                if (retries === maxRetries) {
+                    console.error(
+                        "Max retries reached. Failed to send message with attachment."
+                    );
+                    break;
+                }
+
+                // Wait for a short delay before retrying
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+            }
+        }
+
+        return response;
+    },
+    examples: [
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Downloading the YouTube video now, one sec",
+                    action: "DOWNLOAD_MEDIA",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "Can you grab this video for me? https://vimeo.com/123456789",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "Sure thing, I'll download that Vimeo video for you",
+                    action: "DOWNLOAD_MEDIA",
+                },
+            },
+        ],
+        [
+            {
+                user: "{{user1}}",
+                content: {
+                    text: "I need this video downloaded: https://www.youtube.com/watch?v=abcdefg",
+                },
+            },
+            {
+                user: "{{user2}}",
+                content: {
+                    text: "No problem, I'm on it. I'll have that YouTube video downloaded in a jiffy",
+                    action: "DOWNLOAD_MEDIA",
+                },
+            },
+        ],
+    ] as ActionExample[][],
+} as Action;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/providers/channelState.ts`:
+
+```ts
+import {
+    ChannelType,
+    Message as DiscordMessage,
+    TextChannel,
+} from "discord.js";
+import { IAgentRuntime, Memory, Provider, State } from "@elizaos/core";
+
+const channelStateProvider: Provider = {
+    get: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
+        const discordMessage =
+            (state?.discordMessage as DiscordMessage) ||
+            (state?.discordChannel as DiscordMessage);
+        if (!discordMessage) {
+            return "";
+        }
+
+        const guild = discordMessage?.guild;
+        const agentName = state?.agentName || "The agent";
+        const senderName = state?.senderName || "someone";
+
+        if (!guild) {
+            return (
+                agentName +
+                " is currently in a direct message conversation with " +
+                senderName
+            );
+        }
+
+        const serverName = guild.name; // The name of the server
+        const guildId = guild.id; // The ID of the guild
+        const channel = discordMessage.channel;
+
+        if (!channel) {
+            console.log("channel is null");
+            return "";
+        }
+
+        let response =
+            agentName +
+            " is currently having a conversation in the channel `@" +
+            channel.id +
+            " in the server `" +
+            serverName +
+            "` (@" +
+            guildId +
+            ")";
+        if (
+            channel.type === ChannelType.GuildText &&
+            (channel as TextChannel).topic
+        ) {
+            // Check if the channel is a text channel
+            response +=
+                "\nThe topic of the channel is: " +
+                (channel as TextChannel).topic;
+        }
+        return response;
+    },
+};
+
+export default channelStateProvider;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/providers/voiceState.ts`:
+
+```ts
+import { getVoiceConnection } from "@discordjs/voice";
+import { ChannelType, Message as DiscordMessage } from "discord.js";
+import { IAgentRuntime, Memory, Provider, State } from "@elizaos/core";
+
+const voiceStateProvider: Provider = {
+    get: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
+        // Voice doesn't get a discord message, so we need to use the channel for guild data
+        const discordMessage = (state?.discordMessage ||
+            state.discordChannel) as DiscordMessage;
+        const connection = getVoiceConnection(
+            (discordMessage as DiscordMessage)?.guild?.id as string
+        );
+        const agentName = state?.agentName || "The agent";
+        if (!connection) {
+            return agentName + " is not currently in a voice channel";
+        }
+
+        const channel = (
+            (state?.discordMessage as DiscordMessage) ||
+            (state.discordChannel as DiscordMessage)
+        )?.guild?.channels?.cache?.get(
+            connection.joinConfig.channelId as string
+        );
+
+        if (!channel || channel.type !== ChannelType.GuildVoice) {
+            return agentName + " is in an invalid voice channel";
+        }
+
+        return `${agentName} is currently in the voice channel: ${channel.name} (ID: ${channel.id})`;
+    },
+};
+
+export default voiceStateProvider;
+
+```
+
+`/root/eliza_new/packages/client-discord/src/voice.ts`:
+
+```ts
+import {
+    Content,
+    HandlerCallback,
+    IAgentRuntime,
+    Memory,
+    ModelClass,
+    ServiceType,
+    State,
+    UUID,
+    composeContext,
+    composeRandomUser,
+    elizaLogger,
+    getEmbeddingZeroVector,
+    generateMessageResponse,
+    stringToUuid,
+    generateShouldRespond,
+    ITranscriptionService,
+    ISpeechService,
+} from "@elizaos/core";
+import {
+    AudioPlayer,
+    AudioReceiveStream,
+    NoSubscriberBehavior,
+    StreamType,
+    VoiceConnection,
+    VoiceConnectionStatus,
+    createAudioPlayer,
+    createAudioResource,
+    getVoiceConnections,
+    joinVoiceChannel,
+    entersState,
+} from "@discordjs/voice";
+import {
+    BaseGuildVoiceChannel,
+    ChannelType,
+    Client,
+    Guild,
+    GuildMember,
+    VoiceChannel,
+    VoiceState,
+} from "discord.js";
+import EventEmitter from "events";
+import prism from "prism-media";
+import { Readable, pipeline } from "stream";
+import { DiscordClient } from "./index.ts";
+import {
+    discordShouldRespondTemplate,
+    discordVoiceHandlerTemplate,
+} from "./templates.ts";
+import { getWavHeader } from "./utils.ts";
+
+// These values are chosen for compatibility with picovoice components
+const DECODE_FRAME_SIZE = 1024;
+const DECODE_SAMPLE_RATE = 16000;
+
+export class AudioMonitor {
+    private readable: Readable;
+    private buffers: Buffer[] = [];
+    private maxSize: number;
+    private lastFlagged: number = -1;
+    private ended: boolean = false;
+
+    constructor(
+        readable: Readable,
+        maxSize: number,
+        onStart: () => void,
+        callback: (buffer: Buffer) => void
+    ) {
+        this.readable = readable;
+        this.maxSize = maxSize;
+        this.readable.on("data", (chunk: Buffer) => {
+            //console.log('AudioMonitor got data');
+            if (this.lastFlagged < 0) {
+                this.lastFlagged = this.buffers.length;
+            }
+            this.buffers.push(chunk);
+            const currentSize = this.buffers.reduce(
+                (acc, cur) => acc + cur.length,
+                0
+            );
+            while (currentSize > this.maxSize) {
+                this.buffers.shift();
+                this.lastFlagged--;
+            }
+        });
+        this.readable.on("end", () => {
+            elizaLogger.log("AudioMonitor ended");
+            this.ended = true;
+            if (this.lastFlagged < 0) return;
+            callback(this.getBufferFromStart());
+            this.lastFlagged = -1;
+        });
+        this.readable.on("speakingStopped", () => {
+            if (this.ended) return;
+            elizaLogger.log("Speaking stopped");
+            if (this.lastFlagged < 0) return;
+            callback(this.getBufferFromStart());
+        });
+        this.readable.on("speakingStarted", () => {
+            if (this.ended) return;
+            onStart();
+            elizaLogger.log("Speaking started");
+            this.reset();
+        });
+    }
+
+    stop() {
+        this.readable.removeAllListeners("data");
+        this.readable.removeAllListeners("end");
+        this.readable.removeAllListeners("speakingStopped");
+        this.readable.removeAllListeners("speakingStarted");
+    }
+
+    isFlagged() {
+        return this.lastFlagged >= 0;
+    }
+
+    getBufferFromFlag() {
+        if (this.lastFlagged < 0) {
+            return null;
+        }
+        const buffer = Buffer.concat(this.buffers.slice(this.lastFlagged));
+        return buffer;
+    }
+
+    getBufferFromStart() {
+        const buffer = Buffer.concat(this.buffers);
+        return buffer;
+    }
+
+    reset() {
+        this.buffers = [];
+        this.lastFlagged = -1;
+    }
+
+    isEnded() {
+        return this.ended;
+    }
+}
+
+export class VoiceManager extends EventEmitter {
+    private processingVoice: boolean = false;
+    private transcriptionTimeout: NodeJS.Timeout | null = null;
+    private userStates: Map<
+        string,
+        {
+            buffers: Buffer[];
+            totalLength: number;
+            lastActive: number;
+            transcriptionText: string;
+        }
+    > = new Map();
+    private activeAudioPlayer: AudioPlayer | null = null;
+    private client: Client;
+    private runtime: IAgentRuntime;
+    private streams: Map<string, Readable> = new Map();
+    private connections: Map<string, VoiceConnection> = new Map();
+    private activeMonitors: Map<
+        string,
+        { channel: BaseGuildVoiceChannel; monitor: AudioMonitor }
+    > = new Map();
+
+    constructor(client: DiscordClient) {
+        super();
+        this.client = client.client;
+        this.runtime = client.runtime;
+    }
+
+    async handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState) {
+        const oldChannelId = oldState.channelId;
+        const newChannelId = newState.channelId;
+        const member = newState.member;
+        if (!member) return;
+        if (member.id === this.client.user?.id) {
+            return;
+        }
+
+        // Ignore mute/unmute events
+        if (oldChannelId === newChannelId) {
+            return;
+        }
+
+        // User leaving a channel where the bot is present
+        if (oldChannelId && this.connections.has(oldChannelId)) {
+            this.stopMonitoringMember(member.id);
+        }
+
+        // User joining a channel where the bot is present
+        if (newChannelId && this.connections.has(newChannelId)) {
+            await this.monitorMember(
+                member,
+                newState.channel as BaseGuildVoiceChannel
+            );
+        }
+    }
+
+    async joinChannel(channel: BaseGuildVoiceChannel) {
+        const oldConnection = this.getVoiceConnection(
+            channel.guildId as string
+        );
+        if (oldConnection) {
+            try {
+                oldConnection.destroy();
+                // Remove all associated streams and monitors
+                this.streams.clear();
+                this.activeMonitors.clear();
+            } catch (error) {
+                console.error("Error leaving voice channel:", error);
+            }
+        }
+
+        const connection = joinVoiceChannel({
+            channelId: channel.id,
+            guildId: channel.guild.id,
+            adapterCreator: channel.guild.voiceAdapterCreator as any,
+            selfDeaf: false,
+            selfMute: false,
+            group: this.client.user.id,
+        });
+
+        try {
+            // Wait for either Ready or Signalling state
+            await Promise.race([
+                entersState(connection, VoiceConnectionStatus.Ready, 20_000),
+                entersState(
+                    connection,
+                    VoiceConnectionStatus.Signalling,
+                    20_000
+                ),
+            ]);
+
+            // Log connection success
+            elizaLogger.log(
+                `Voice connection established in state: ${connection.state.status}`
+            );
+
+            // Set up ongoing state change monitoring
+            connection.on("stateChange", async (oldState, newState) => {
+                elizaLogger.log(
+                    `Voice connection state changed from ${oldState.status} to ${newState.status}`
+                );
+
+                if (newState.status === VoiceConnectionStatus.Disconnected) {
+                    elizaLogger.log("Handling disconnection...");
+
+                    try {
+                        // Try to reconnect if disconnected
+                        await Promise.race([
+                            entersState(
+                                connection,
+                                VoiceConnectionStatus.Signalling,
+                                5_000
+                            ),
+                            entersState(
+                                connection,
+                                VoiceConnectionStatus.Connecting,
+                                5_000
+                            ),
+                        ]);
+                        // Seems to be reconnecting to a new channel
+                        elizaLogger.log("Reconnecting to channel...");
+                    } catch (e) {
+                        // Seems to be a real disconnect, destroy and cleanup
+                        elizaLogger.log(
+                            "Disconnection confirmed - cleaning up..." + e
+                        );
+                        connection.destroy();
+                        this.connections.delete(channel.id);
+                    }
+                } else if (
+                    newState.status === VoiceConnectionStatus.Destroyed
+                ) {
+                    this.connections.delete(channel.id);
+                } else if (
+                    !this.connections.has(channel.id) &&
+                    (newState.status === VoiceConnectionStatus.Ready ||
+                        newState.status === VoiceConnectionStatus.Signalling)
+                ) {
+                    this.connections.set(channel.id, connection);
+                }
+            });
+
+            connection.on("error", (error) => {
+                elizaLogger.log("Voice connection error:", error);
+                // Don't immediately destroy - let the state change handler deal with it
+                elizaLogger.log(
+                    "Connection error - will attempt to recover..."
+                );
+            });
+
+            // Store the connection
+            this.connections.set(channel.id, connection);
+
+            // Continue with voice state modifications
+            const me = channel.guild.members.me;
+            if (me?.voice && me.permissions.has("DeafenMembers")) {
+                try {
+                    await me.voice.setDeaf(false);
+                    await me.voice.setMute(false);
+                } catch (error) {
+                    elizaLogger.log("Failed to modify voice state:", error);
+                    // Continue even if this fails
+                }
+            }
+
+            connection.receiver.speaking.on("start", async (userId: string) => {
+                let user = channel.members.get(userId);
+                if (!user) {
+                    try {
+                        user = await channel.guild.members.fetch(userId);
+                    } catch (error) {
+                        console.error("Failed to fetch user:", error);
+                    }
+                }
+                if (user && !user?.user.bot) {
+                    this.monitorMember(user as GuildMember, channel);
+                    this.streams.get(userId)?.emit("speakingStarted");
+                }
+            });
+
+            connection.receiver.speaking.on("end", async (userId: string) => {
+                const user = channel.members.get(userId);
+                if (!user?.user.bot) {
+                    this.streams.get(userId)?.emit("speakingStopped");
+                }
+            });
+        } catch (error) {
+            elizaLogger.log("Failed to establish voice connection:", error);
+            connection.destroy();
+            this.connections.delete(channel.id);
+            throw error;
+        }
+    }
+
+    private getVoiceConnection(guildId: string) {
+        const connections = getVoiceConnections(this.client.user.id);
+        if (!connections) {
+            return;
+        }
+        const connection = [...connections.values()].find(
+            (connection) => connection.joinConfig.guildId === guildId
+        );
+        return connection;
+    }
+
+    private async monitorMember(
+        member: GuildMember,
+        channel: BaseGuildVoiceChannel
+    ) {
+        const userId = member?.id;
+        const userName = member?.user?.username;
+        const name = member?.user?.displayName;
+        const connection = this.getVoiceConnection(member?.guild?.id);
+        const receiveStream = connection?.receiver.subscribe(userId, {
+            autoDestroy: true,
+            emitClose: true,
+        });
+        if (!receiveStream || receiveStream.readableLength === 0) {
+            return;
+        }
+        const opusDecoder = new prism.opus.Decoder({
+            channels: 1,
+            rate: DECODE_SAMPLE_RATE,
+            frameSize: DECODE_FRAME_SIZE,
+        });
+        const volumeBuffer: number[] = [];
+        const VOLUME_WINDOW_SIZE = 30;
+        const SPEAKING_THRESHOLD = 0.05;
+        opusDecoder.on("data", (pcmData: Buffer) => {
+            // Monitor the audio volume while the agent is speaking.
+            // If the average volume of the user's audio exceeds the defined threshold, it indicates active speaking.
+            // When active speaking is detected, stop the agent's current audio playback to avoid overlap.
+
+            if (this.activeAudioPlayer) {
+                const samples = new Int16Array(
+                    pcmData.buffer,
+                    pcmData.byteOffset,
+                    pcmData.length / 2
+                );
+                const maxAmplitude = Math.max(...samples.map(Math.abs)) / 32768;
+                volumeBuffer.push(maxAmplitude);
+
+                if (volumeBuffer.length > VOLUME_WINDOW_SIZE) {
+                    volumeBuffer.shift();
+                }
+                const avgVolume =
+                    volumeBuffer.reduce((sum, v) => sum + v, 0) /
+                    VOLUME_WINDOW_SIZE;
+
+                if (avgVolume > SPEAKING_THRESHOLD) {
+                    volumeBuffer.length = 0;
+                    this.cleanupAudioPlayer(this.activeAudioPlayer);
+                    this.processingVoice = false;
+                }
+            }
+        });
+        pipeline(
+            receiveStream as AudioReceiveStream,
+            opusDecoder as any,
+            (err: Error | null) => {
+                if (err) {
+                    console.log(`Opus decoding pipeline error: ${err}`);
+                }
+            }
+        );
+        this.streams.set(userId, opusDecoder);
+        this.connections.set(userId, connection as VoiceConnection);
+        opusDecoder.on("error", (err: any) => {
+            console.log(`Opus decoding error: ${err}`);
+        });
+        const errorHandler = (err: any) => {
+            console.log(`Opus decoding error: ${err}`);
+        };
+        const streamCloseHandler = () => {
+            console.log(`voice stream from ${member?.displayName} closed`);
+            this.streams.delete(userId);
+            this.connections.delete(userId);
+        };
+        const closeHandler = () => {
+            console.log(`Opus decoder for ${member?.displayName} closed`);
+            opusDecoder.removeListener("error", errorHandler);
+            opusDecoder.removeListener("close", closeHandler);
+            receiveStream?.removeListener("close", streamCloseHandler);
+        };
+        opusDecoder.on("error", errorHandler);
+        opusDecoder.on("close", closeHandler);
+        receiveStream?.on("close", streamCloseHandler);
+
+        this.client.emit(
+            "userStream",
+            userId,
+            name,
+            userName,
+            channel,
+            opusDecoder
+        );
+    }
+
+    leaveChannel(channel: BaseGuildVoiceChannel) {
+        const connection = this.connections.get(channel.id);
+        if (connection) {
+            connection.destroy();
+            this.connections.delete(channel.id);
+        }
+
+        // Stop monitoring all members in this channel
+        for (const [memberId, monitorInfo] of this.activeMonitors) {
+            if (
+                monitorInfo.channel.id === channel.id &&
+                memberId !== this.client.user?.id
+            ) {
+                this.stopMonitoringMember(memberId);
+            }
+        }
+
+        console.log(`Left voice channel: ${channel.name} (${channel.id})`);
+    }
+
+    stopMonitoringMember(memberId: string) {
+        const monitorInfo = this.activeMonitors.get(memberId);
+        if (monitorInfo) {
+            monitorInfo.monitor.stop();
+            this.activeMonitors.delete(memberId);
+            this.streams.delete(memberId);
+            console.log(`Stopped monitoring user ${memberId}`);
+        }
+    }
+
+    async handleGuildCreate(guild: Guild) {
+        console.log(`Joined guild ${guild.name}`);
+        // this.scanGuild(guild);
+    }
+
+    async debouncedProcessTranscription(
+        userId: UUID,
+        name: string,
+        userName: string,
+        channel: BaseGuildVoiceChannel
+    ) {
+        const DEBOUNCE_TRANSCRIPTION_THRESHOLD = 1500; // wait for 1.5 seconds of silence
+
+        if (this.activeAudioPlayer?.state?.status === "idle") {
+            elizaLogger.log("Cleaning up idle audio player.");
+            this.cleanupAudioPlayer(this.activeAudioPlayer);
+        }
+
+        if (this.activeAudioPlayer || this.processingVoice) {
+            const state = this.userStates.get(userId);
+            state.buffers.length = 0;
+            state.totalLength = 0;
+            return;
+        }
+
+        if (this.transcriptionTimeout) {
+            clearTimeout(this.transcriptionTimeout);
+        }
+
+        this.transcriptionTimeout = setTimeout(async () => {
+            this.processingVoice = true;
+            try {
+                await this.processTranscription(
+                    userId,
+                    channel.id,
+                    channel,
+                    name,
+                    userName
+                );
+
+                // Clean all users' previous buffers
+                this.userStates.forEach((state, _) => {
+                    state.buffers.length = 0;
+                    state.totalLength = 0;
+                });
+            } finally {
+                this.processingVoice = false;
+            }
+        }, DEBOUNCE_TRANSCRIPTION_THRESHOLD);
+    }
+
+    async handleUserStream(
+        userId: UUID,
+        name: string,
+        userName: string,
+        channel: BaseGuildVoiceChannel,
+        audioStream: Readable
+    ) {
+        console.log(`Starting audio monitor for user: ${userId}`);
+        if (!this.userStates.has(userId)) {
+            this.userStates.set(userId, {
+                buffers: [],
+                totalLength: 0,
+                lastActive: Date.now(),
+                transcriptionText: "",
+            });
+        }
+
+        const state = this.userStates.get(userId);
+
+        const processBuffer = async (buffer: Buffer) => {
+            try {
+                state!.buffers.push(buffer);
+                state!.totalLength += buffer.length;
+                state!.lastActive = Date.now();
+                this.debouncedProcessTranscription(
+                    userId,
+                    name,
+                    userName,
+                    channel
+                );
+            } catch (error) {
+                console.error(
+                    `Error processing buffer for user ${userId}:`,
+                    error
+                );
+            }
+        };
+
+        new AudioMonitor(
+            audioStream,
+            10000000,
+            () => {
+                if (this.transcriptionTimeout) {
+                    clearTimeout(this.transcriptionTimeout);
+                }
+            },
+            async (buffer) => {
+                if (!buffer) {
+                    console.error("Received empty buffer");
+                    return;
+                }
+                await processBuffer(buffer);
+            }
+        );
+    }
+
+    private async processTranscription(
+        userId: UUID,
+        channelId: string,
+        channel: BaseGuildVoiceChannel,
+        name: string,
+        userName: string
+    ) {
+        const state = this.userStates.get(userId);
+        if (!state || state.buffers.length === 0) return;
+        try {
+            const inputBuffer = Buffer.concat(state.buffers, state.totalLength);
+
+            state.buffers.length = 0; // Clear the buffers
+            state.totalLength = 0;
+            // Convert Opus to WAV
+            const wavBuffer = await this.convertOpusToWav(inputBuffer);
+            console.log("Starting transcription...");
+
+            const transcriptionText = await this.runtime
+                .getService<ITranscriptionService>(ServiceType.TRANSCRIPTION)
+                .transcribe(wavBuffer);
+
+            function isValidTranscription(text: string): boolean {
+                if (!text || text.includes("[BLANK_AUDIO]")) return false;
+                return true;
+            }
+
+            if (transcriptionText && isValidTranscription(transcriptionText)) {
+                state.transcriptionText += transcriptionText;
+            }
+
+            if (state.transcriptionText.length) {
+                this.cleanupAudioPlayer(this.activeAudioPlayer);
+                const finalText = state.transcriptionText;
+                state.transcriptionText = "";
+                await this.handleUserMessage(
+                    finalText,
+                    userId,
+                    channelId,
+                    channel,
+                    name,
+                    userName
+                );
+            }
+        } catch (error) {
+            console.error(
+                `Error transcribing audio for user ${userId}:`,
+                error
+            );
+        }
+    }
+
+    private async handleUserMessage(
+        message: string,
+        userId: UUID,
+        channelId: string,
+        channel: BaseGuildVoiceChannel,
+        name: string,
+        userName: string
+    ) {
+        try {
+            const roomId = stringToUuid(channelId + "-" + this.runtime.agentId);
+            const userIdUUID = stringToUuid(userId);
+
+            await this.runtime.ensureConnection(
+                userIdUUID,
+                roomId,
+                userName,
+                name,
+                "discord"
+            );
+
+            let state = await this.runtime.composeState(
+                {
+                    agentId: this.runtime.agentId,
+                    content: { text: message, source: "Discord" },
+                    userId: userIdUUID,
+                    roomId,
+                },
+                {
+                    discordChannel: channel,
+                    discordClient: this.client,
+                    agentName: this.runtime.character.name,
+                }
+            );
+
+            if (message && message.startsWith("/")) {
+                return null;
+            }
+
+            const memory = {
+                id: stringToUuid(channelId + "-voice-message-" + Date.now()),
+                agentId: this.runtime.agentId,
+                content: {
+                    text: message,
+                    source: "discord",
+                    url: channel.url,
+                },
+                userId: userIdUUID,
+                roomId,
+                embedding: getEmbeddingZeroVector(),
+                createdAt: Date.now(),
+            };
+
+            if (!memory.content.text) {
+                return { text: "", action: "IGNORE" };
+            }
+
+            await this.runtime.messageManager.createMemory(memory);
+
+            state = await this.runtime.updateRecentMessageState(state);
+
+            const shouldIgnore = await this._shouldIgnore(memory);
+
+            if (shouldIgnore) {
+                return { text: "", action: "IGNORE" };
+            }
+
+            const shouldRespond = await this._shouldRespond(
+                message,
+                userId,
+                channel,
+                state
+            );
+
+            if (!shouldRespond) {
+                return;
+            }
+
+            const context = composeContext({
+                state,
+                template:
+                    this.runtime.character.templates
+                        ?.discordVoiceHandlerTemplate ||
+                    this.runtime.character.templates?.messageHandlerTemplate ||
+                    discordVoiceHandlerTemplate,
+            });
+
+            const responseContent = await this._generateResponse(
+                memory,
+                state,
+                context
+            );
+
+            const callback: HandlerCallback = async (content: Content) => {
+                console.log("callback content: ", content);
+                const { roomId } = memory;
+
+                const responseMemory: Memory = {
+                    id: stringToUuid(
+                        memory.id + "-voice-response-" + Date.now()
+                    ),
+                    agentId: this.runtime.agentId,
+                    userId: this.runtime.agentId,
+                    content: {
+                        ...content,
+                        user: this.runtime.character.name,
+                        inReplyTo: memory.id,
+                    },
+                    roomId,
+                    embedding: getEmbeddingZeroVector(),
+                };
+
+                if (responseMemory.content.text?.trim()) {
+                    await this.runtime.messageManager.createMemory(
+                        responseMemory
+                    );
+                    state = await this.runtime.updateRecentMessageState(state);
+
+                    const responseStream = await this.runtime
+                        .getService<ISpeechService>(
+                            ServiceType.SPEECH_GENERATION
+                        )
+                        .generate(this.runtime, content.text);
+
+                    if (responseStream) {
+                        await this.playAudioStream(
+                            userId,
+                            responseStream as Readable
+                        );
+                    }
+
+                    await this.runtime.evaluate(memory, state);
+                } else {
+                    console.warn("Empty response, skipping");
+                }
+                return [responseMemory];
+            };
+
+            const responseMemories = await callback(responseContent);
+
+            const response = responseContent;
+
+            const content = (response.responseMessage ||
+                response.content ||
+                response.message) as string;
+
+            if (!content) {
+                return null;
+            }
+
+            console.log("responseMemories: ", responseMemories);
+
+            await this.runtime.processActions(
+                memory,
+                responseMemories,
+                state,
+                callback
+            );
+        } catch (error) {
+            console.error("Error processing transcribed text:", error);
+        }
+    }
+
+    private async convertOpusToWav(pcmBuffer: Buffer): Promise<Buffer> {
+        try {
+            // Generate the WAV header
+            const wavHeader = getWavHeader(
+                pcmBuffer.length,
+                DECODE_SAMPLE_RATE
+            );
+
+            // Concatenate the WAV header and PCM data
+            const wavBuffer = Buffer.concat([wavHeader, pcmBuffer]);
+
+            return wavBuffer;
+        } catch (error) {
+            console.error("Error converting PCM to WAV:", error);
+            throw error;
+        }
+    }
+
+    private async _shouldRespond(
+        message: string,
+        userId: UUID,
+        channel: BaseGuildVoiceChannel,
+        state: State
+    ): Promise<boolean> {
+        if (userId === this.client.user?.id) return false;
+        const lowerMessage = message.toLowerCase();
+        const botName = this.client.user.username.toLowerCase();
+        const characterName = this.runtime.character.name.toLowerCase();
+        const guild = channel.guild;
+        const member = guild?.members.cache.get(this.client.user?.id as string);
+        const nickname = member?.nickname;
+
+        if (
+            lowerMessage.includes(botName as string) ||
+            lowerMessage.includes(characterName) ||
+            lowerMessage.includes(
+                this.client.user?.tag.toLowerCase() as string
+            ) ||
+            (nickname && lowerMessage.includes(nickname.toLowerCase()))
+        ) {
+            return true;
+        }
+
+        if (!channel.guild) {
+            return true;
+        }
+
+        // If none of the above conditions are met, use the generateText to decide
+        const shouldRespondContext = composeContext({
+            state,
+            template:
+                this.runtime.character.templates
+                    ?.discordShouldRespondTemplate ||
+                this.runtime.character.templates?.shouldRespondTemplate ||
+                composeRandomUser(discordShouldRespondTemplate, 2),
+        });
+
+        const response = await generateShouldRespond({
+            runtime: this.runtime,
+            context: shouldRespondContext,
+            modelClass: ModelClass.SMALL,
+        });
+
+        if (response === "RESPOND") {
+            return true;
+        } else if (response === "IGNORE") {
+            return false;
+        } else if (response === "STOP") {
+            return false;
+        } else {
+            console.error(
+                "Invalid response from response generateText:",
+                response
+            );
+            return false;
+        }
+    }
+
+    private async _generateResponse(
+        message: Memory,
+        state: State,
+        context: string
+    ): Promise<Content> {
+        const { userId, roomId } = message;
+
+        const response = await generateMessageResponse({
+            runtime: this.runtime,
+            context,
+            modelClass: ModelClass.SMALL,
+        });
+
+        response.source = "discord";
+
+        if (!response) {
+            console.error("No response from generateMessageResponse");
+            return;
+        }
+
+        await this.runtime.databaseAdapter.log({
+            body: { message, context, response },
+            userId: userId,
+            roomId,
+            type: "response",
+        });
+
+        return response;
+    }
+
+    private async _shouldIgnore(message: Memory): Promise<boolean> {
+        // console.log("message: ", message);
+        elizaLogger.debug("message.content: ", message.content);
+        // if the message is 3 characters or less, ignore it
+        if ((message.content as Content).text.length < 3) {
+            return true;
+        }
+
+        const loseInterestWords = [
+            // telling the bot to stop talking
+            "shut up",
+            "stop",
+            "dont talk",
+            "silence",
+            "stop talking",
+            "be quiet",
+            "hush",
+            "stfu",
+            "stupid bot",
+            "dumb bot",
+
+            // offensive words
+            "fuck",
+            "shit",
+            "damn",
+            "suck",
+            "dick",
+            "cock",
+            "sex",
+            "sexy",
+        ];
+        if (
+            (message.content as Content).text.length < 50 &&
+            loseInterestWords.some((word) =>
+                (message.content as Content).text?.toLowerCase().includes(word)
+            )
+        ) {
+            return true;
+        }
+
+        const ignoreWords = ["k", "ok", "bye", "lol", "nm", "uh"];
+        if (
+            (message.content as Content).text?.length < 8 &&
+            ignoreWords.some((word) =>
+                (message.content as Content).text?.toLowerCase().includes(word)
+            )
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    async scanGuild(guild: Guild) {
+        let chosenChannel: BaseGuildVoiceChannel | null = null;
+
+        try {
+            const channelId = this.runtime.getSetting(
+                "DISCORD_VOICE_CHANNEL_ID"
+            ) as string;
+            if (channelId) {
+                const channel = await guild.channels.fetch(channelId);
+                if (channel?.isVoiceBased()) {
+                    chosenChannel = channel as BaseGuildVoiceChannel;
+                }
+            }
+
+            if (!chosenChannel) {
+                const channels = (await guild.channels.fetch()).filter(
+                    (channel) => channel?.type == ChannelType.GuildVoice
+                );
+                for (const [, channel] of channels) {
+                    const voiceChannel = channel as BaseGuildVoiceChannel;
+                    if (
+                        voiceChannel.members.size > 0 &&
+                        (chosenChannel === null ||
+                            voiceChannel.members.size >
+                                chosenChannel.members.size)
+                    ) {
+                        chosenChannel = voiceChannel;
+                    }
+                }
+            }
+
+            if (chosenChannel) {
+                console.log(`Joining channel: ${chosenChannel.name}`);
+                await this.joinChannel(chosenChannel);
+            } else {
+                console.warn("No suitable voice channel found to join.");
+            }
+        } catch (error) {
+            console.error("Error selecting or joining a voice channel:", error);
+        }
+    }
+
+    async playAudioStream(userId: UUID, audioStream: Readable) {
+        const connection = this.connections.get(userId);
+        if (connection == null) {
+            console.log(`No connection for user ${userId}`);
+            return;
+        }
+        this.cleanupAudioPlayer(this.activeAudioPlayer);
+        const audioPlayer = createAudioPlayer({
+            behaviors: {
+                noSubscriber: NoSubscriberBehavior.Pause,
+            },
+        });
+        this.activeAudioPlayer = audioPlayer;
+        connection.subscribe(audioPlayer);
+
+        const audioStartTime = Date.now();
+
+        const resource = createAudioResource(audioStream, {
+            inputType: StreamType.Arbitrary,
+        });
+        audioPlayer.play(resource);
+
+        audioPlayer.on("error", (err: any) => {
+            console.log(`Audio player error: ${err}`);
+        });
+
+        audioPlayer.on(
+            "stateChange",
+            (_oldState: any, newState: { status: string }) => {
+                if (newState.status == "idle") {
+                    const idleTime = Date.now();
+                    console.log(
+                        `Audio playback took: ${idleTime - audioStartTime}ms`
+                    );
+                }
+            }
+        );
+    }
+
+    cleanupAudioPlayer(audioPlayer: AudioPlayer) {
+        if (!audioPlayer) return;
+
+        audioPlayer.stop();
+        audioPlayer.removeAllListeners();
+        if (audioPlayer === this.activeAudioPlayer) {
+            this.activeAudioPlayer = null;
+        }
+    }
+
+    async handleJoinChannelCommand(interaction: any) {
+        try {
+            // Defer the reply immediately to prevent interaction timeout
+            await interaction.deferReply();
+
+            const channelId = interaction.options.get("channel")
+                ?.value as string;
+            if (!channelId) {
+                await interaction.editReply(
+                    "Please provide a voice channel to join."
+                );
+                return;
+            }
+
+            const guild = interaction.guild;
+            if (!guild) {
+                await interaction.editReply("Could not find guild.");
+                return;
+            }
+
+            const voiceChannel = interaction.guild.channels.cache.find(
+                (channel: VoiceChannel) =>
+                    channel.id === channelId &&
+                    channel.type === ChannelType.GuildVoice
+            );
+
+            if (!voiceChannel) {
+                await interaction.editReply("Voice channel not found!");
+                return;
+            }
+
+            await this.joinChannel(voiceChannel as BaseGuildVoiceChannel);
+            await interaction.editReply(
+                `Joined voice channel: ${voiceChannel.name}`
+            );
+        } catch (error) {
+            console.error("Error joining voice channel:", error);
+            // Use editReply instead of reply for the error case
+            await interaction
+                .editReply("Failed to join the voice channel.")
+                .catch(console.error);
+        }
+    }
+
+    async handleLeaveChannelCommand(interaction: any) {
+        const connection = this.getVoiceConnection(interaction.guildId as any);
+
+        if (!connection) {
+            await interaction.reply("Not currently in a voice channel.");
+            return;
+        }
+
+        try {
+            connection.destroy();
+            await interaction.reply("Left the voice channel.");
+        } catch (error) {
+            console.error("Error leaving voice channel:", error);
+            await interaction.reply("Failed to leave the voice channel.");
+        }
+    }
+}
+
+```
+
+`/root/eliza_new/packages/client-discord/src/attachments.ts`:
+
+```ts
+import { generateText, trimTokens } from "@elizaos/core";
+import { parseJSONObjectFromText } from "@elizaos/core";
+import {
+    IAgentRuntime,
+    IImageDescriptionService,
+    IPdfService,
+    ITranscriptionService,
+    IVideoService,
+    Media,
+    ModelClass,
+    ServiceType,
+} from "@elizaos/core";
+import { Attachment, Collection } from "discord.js";
+import ffmpeg from "fluent-ffmpeg";
+import fs from "fs";
+
+async function generateSummary(
+    runtime: IAgentRuntime,
+    text: string
+): Promise<{ title: string; description: string }> {
+    // make sure text is under 128k characters
+    text = await trimTokens(text, 100000, runtime);
+
+    const prompt = `Please generate a concise summary for the following text:
+
+  Text: """
+  ${text}
+  """
+
+  Respond with a JSON object in the following format:
+  \`\`\`json
+  {
+    "title": "Generated Title",
+    "summary": "Generated summary and/or description of the text"
+  }
+  \`\`\``;
+
+    const response = await generateText({
+        runtime,
+        context: prompt,
+        modelClass: ModelClass.SMALL,
+    });
+
+    const parsedResponse = parseJSONObjectFromText(response);
+
+    if (parsedResponse) {
+        return {
+            title: parsedResponse.title,
+            description: parsedResponse.summary,
+        };
+    }
+
+    return {
+        title: "",
+        description: "",
+    };
+}
+
+export class AttachmentManager {
+    private attachmentCache: Map<string, Media> = new Map();
+    private runtime: IAgentRuntime;
+
+    constructor(runtime: IAgentRuntime) {
+        this.runtime = runtime;
+    }
+
+    async processAttachments(
+        attachments: Collection<string, Attachment> | Attachment[]
+    ): Promise<Media[]> {
+        const processedAttachments: Media[] = [];
+        const attachmentCollection =
+            attachments instanceof Collection
+                ? attachments
+                : new Collection(attachments.map((att) => [att.id, att]));
+
+        for (const [, attachment] of attachmentCollection) {
+            const media = await this.processAttachment(attachment);
+            if (media) {
+                processedAttachments.push(media);
+            }
+        }
+
+        return processedAttachments;
+    }
+
+    async processAttachment(attachment: Attachment): Promise<Media | null> {
+        if (this.attachmentCache.has(attachment.url)) {
+            return this.attachmentCache.get(attachment.url)!;
+        }
+
+        let media: Media | null = null;
+        if (attachment.contentType?.startsWith("application/pdf")) {
+            media = await this.processPdfAttachment(attachment);
+        } else if (attachment.contentType?.startsWith("text/plain")) {
+            media = await this.processPlaintextAttachment(attachment);
+        } else if (
+            attachment.contentType?.startsWith("audio/") ||
+            attachment.contentType?.startsWith("video/mp4")
+        ) {
+            media = await this.processAudioVideoAttachment(attachment);
+        } else if (attachment.contentType?.startsWith("image/")) {
+            media = await this.processImageAttachment(attachment);
+        } else if (
+            attachment.contentType?.startsWith("video/") ||
+            this.runtime
+                .getService<IVideoService>(ServiceType.VIDEO)
+                .isVideoUrl(attachment.url)
+        ) {
+            media = await this.processVideoAttachment(attachment);
+        } else {
+            media = await this.processGenericAttachment(attachment);
+        }
+
+        if (media) {
+            this.attachmentCache.set(attachment.url, media);
+        }
+        return media;
+    }
+
+    private async processAudioVideoAttachment(
+        attachment: Attachment
+    ): Promise<Media> {
+        try {
+            const response = await fetch(attachment.url);
+            const audioVideoArrayBuffer = await response.arrayBuffer();
+
+            let audioBuffer: Buffer;
+            if (attachment.contentType?.startsWith("audio/")) {
+                audioBuffer = Buffer.from(audioVideoArrayBuffer);
+            } else if (attachment.contentType?.startsWith("video/mp4")) {
+                audioBuffer = await this.extractAudioFromMP4(
+                    audioVideoArrayBuffer
+                );
+            } else {
+                throw new Error("Unsupported audio/video format");
+            }
+
+            const transcriptionService =
+                this.runtime.getService<ITranscriptionService>(
+                    ServiceType.TRANSCRIPTION
+                );
+            if (!transcriptionService) {
+                throw new Error("Transcription service not found");
+            }
+
+            const transcription =
+                await transcriptionService.transcribeAttachment(audioBuffer);
+            const { title, description } = await generateSummary(
+                this.runtime,
+                transcription
+            );
+
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: title || "Audio/Video Attachment",
+                source: attachment.contentType?.startsWith("audio/")
+                    ? "Audio"
+                    : "Video",
+                description:
+                    description ||
+                    "User-uploaded audio/video attachment which has been transcribed",
+                text: transcription || "Audio/video content not available",
+            };
+        } catch (error) {
+            console.error(
+                `Error processing audio/video attachment: ${error.message}`
+            );
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: "Audio/Video Attachment",
+                source: attachment.contentType?.startsWith("audio/")
+                    ? "Audio"
+                    : "Video",
+                description: "An audio/video attachment (transcription failed)",
+                text: `This is an audio/video attachment. File name: ${attachment.name}, Size: ${attachment.size} bytes, Content type: ${attachment.contentType}`,
+            };
+        }
+    }
+
+    private async extractAudioFromMP4(mp4Data: ArrayBuffer): Promise<Buffer> {
+        // Use a library like 'fluent-ffmpeg' or 'ffmpeg-static' to extract the audio stream from the MP4 data
+        // and convert it to MP3 or WAV format
+        // Example using fluent-ffmpeg:
+        const tempMP4File = `temp_${Date.now()}.mp4`;
+        const tempAudioFile = `temp_${Date.now()}.mp3`;
+
+        try {
+            // Write the MP4 data to a temporary file
+            fs.writeFileSync(tempMP4File, Buffer.from(mp4Data));
+
+            // Extract the audio stream and convert it to MP3
+            await new Promise<void>((resolve, reject) => {
+                ffmpeg(tempMP4File)
+                    .outputOptions("-vn") // Disable video output
+                    .audioCodec("libmp3lame") // Set audio codec to MP3
+                    .save(tempAudioFile) // Save the output to the specified file
+                    .on("end", () => {
+                        resolve();
+                    })
+                    .on("error", (err) => {
+                        reject(err);
+                    })
+                    .run();
+            });
+
+            // Read the converted audio file and return it as a Buffer
+            const audioData = fs.readFileSync(tempAudioFile);
+            return audioData;
+        } finally {
+            // Clean up the temporary files
+            if (fs.existsSync(tempMP4File)) {
+                fs.unlinkSync(tempMP4File);
+            }
+            if (fs.existsSync(tempAudioFile)) {
+                fs.unlinkSync(tempAudioFile);
+            }
+        }
+    }
+
+    private async processPdfAttachment(attachment: Attachment): Promise<Media> {
+        try {
+            const response = await fetch(attachment.url);
+            const pdfBuffer = await response.arrayBuffer();
+            const text = await this.runtime
+                .getService<IPdfService>(ServiceType.PDF)
+                .convertPdfToText(Buffer.from(pdfBuffer));
+            const { title, description } = await generateSummary(
+                this.runtime,
+                text
+            );
+
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: title || "PDF Attachment",
+                source: "PDF",
+                description: description || "A PDF document",
+                text: text,
+            };
+        } catch (error) {
+            console.error(`Error processing PDF attachment: ${error.message}`);
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: "PDF Attachment (conversion failed)",
+                source: "PDF",
+                description:
+                    "A PDF document that could not be converted to text",
+                text: `This is a PDF attachment. File name: ${attachment.name}, Size: ${attachment.size} bytes`,
+            };
+        }
+    }
+
+    private async processPlaintextAttachment(
+        attachment: Attachment
+    ): Promise<Media> {
+        try {
+            const response = await fetch(attachment.url);
+            const text = await response.text();
+            const { title, description } = await generateSummary(
+                this.runtime,
+                text
+            );
+
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: title || "Plaintext Attachment",
+                source: "Plaintext",
+                description: description || "A plaintext document",
+                text: text,
+            };
+        } catch (error) {
+            console.error(
+                `Error processing plaintext attachment: ${error.message}`
+            );
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: "Plaintext Attachment (retrieval failed)",
+                source: "Plaintext",
+                description: "A plaintext document that could not be retrieved",
+                text: `This is a plaintext attachment. File name: ${attachment.name}, Size: ${attachment.size} bytes`,
+            };
+        }
+    }
+
+    private async processImageAttachment(
+        attachment: Attachment
+    ): Promise<Media> {
+        try {
+            const { description, title } = await this.runtime
+                .getService<IImageDescriptionService>(
+                    ServiceType.IMAGE_DESCRIPTION
+                )
+                .describeImage(attachment.url);
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: title || "Image Attachment",
+                source: "Image",
+                description: description || "An image attachment",
+                text: description || "Image content not available",
+            };
+        } catch (error) {
+            console.error(
+                `Error processing image attachment: ${error.message}`
+            );
+            return this.createFallbackImageMedia(attachment);
+        }
+    }
+
+    private createFallbackImageMedia(attachment: Attachment): Media {
+        return {
+            id: attachment.id,
+            url: attachment.url,
+            title: "Image Attachment",
+            source: "Image",
+            description: "An image attachment (recognition failed)",
+            text: `This is an image attachment. File name: ${attachment.name}, Size: ${attachment.size} bytes, Content type: ${attachment.contentType}`,
+        };
+    }
+
+    private async processVideoAttachment(
+        attachment: Attachment
+    ): Promise<Media> {
+        const videoService = this.runtime.getService<IVideoService>(
+            ServiceType.VIDEO
+        );
+
+        if (!videoService) {
+            throw new Error("Video service not found");
+        }
+
+        if (videoService.isVideoUrl(attachment.url)) {
+            const videoInfo = await videoService.processVideo(
+                attachment.url,
+                this.runtime
+            );
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: videoInfo.title,
+                source: "YouTube",
+                description: videoInfo.description,
+                text: videoInfo.text,
+            };
+        } else {
+            return {
+                id: attachment.id,
+                url: attachment.url,
+                title: "Video Attachment",
+                source: "Video",
+                description: "A video attachment",
+                text: "Video content not available",
+            };
+        }
+    }
+
+    private async processGenericAttachment(
+        attachment: Attachment
+    ): Promise<Media> {
+        return {
+            id: attachment.id,
+            url: attachment.url,
+            title: "Generic Attachment",
+            source: "Generic",
+            description: "A generic attachment",
+            text: "Attachment content not available",
+        };
+    }
+}
+
+```
+
+`/root/eliza_new/packages/client-discord/src/utils.ts`:
+
+```ts
+import {
+    IAgentRuntime,
+    ModelClass,
+    elizaLogger,
+    generateText,
+    trimTokens,
+    parseJSONObjectFromText,
+} from "@elizaos/core";
+import {
+    ChannelType,
+    Message as DiscordMessage,
+    PermissionsBitField,
+    TextChannel,
+    ThreadChannel,
+} from "discord.js";
+
+export function getWavHeader(
+    audioLength: number,
+    sampleRate: number,
+    channelCount: number = 1,
+    bitsPerSample: number = 16
+): Buffer {
+    const wavHeader = Buffer.alloc(44);
+    wavHeader.write("RIFF", 0);
+    wavHeader.writeUInt32LE(36 + audioLength, 4); // Length of entire file in bytes minus 8
+    wavHeader.write("WAVE", 8);
+    wavHeader.write("fmt ", 12);
+    wavHeader.writeUInt32LE(16, 16); // Length of format data
+    wavHeader.writeUInt16LE(1, 20); // Type of format (1 is PCM)
+    wavHeader.writeUInt16LE(channelCount, 22); // Number of channels
+    wavHeader.writeUInt32LE(sampleRate, 24); // Sample rate
+    wavHeader.writeUInt32LE(
+        (sampleRate * bitsPerSample * channelCount) / 8,
+        28
+    ); // Byte rate
+    wavHeader.writeUInt16LE((bitsPerSample * channelCount) / 8, 32); // Block align ((BitsPerSample * Channels) / 8)
+    wavHeader.writeUInt16LE(bitsPerSample, 34); // Bits per sample
+    wavHeader.write("data", 36); // Data chunk header
+    wavHeader.writeUInt32LE(audioLength, 40); // Data chunk size
+    return wavHeader;
+}
+
+const MAX_MESSAGE_LENGTH = 1900;
+
+export async function generateSummary(
+    runtime: IAgentRuntime,
+    text: string
+): Promise<{ title: string; description: string }> {
+    // make sure text is under 128k characters
+    text = await trimTokens(text, 100000, runtime);
+
+    const prompt = `Please generate a concise summary for the following text:
+
+  Text: """
+  ${text}
+  """
+
+  Respond with a JSON object in the following format:
+  \`\`\`json
+  {
+    "title": "Generated Title",
+    "summary": "Generated summary and/or description of the text"
+  }
+  \`\`\``;
+
+    const response = await generateText({
+        runtime,
+        context: prompt,
+        modelClass: ModelClass.SMALL,
+    });
+
+    const parsedResponse = parseJSONObjectFromText(response);
+
+    if (parsedResponse) {
+        return {
+            title: parsedResponse.title,
+            description: parsedResponse.summary,
+        };
+    }
+
+    return {
+        title: "",
+        description: "",
+    };
+}
+
+export async function sendMessageInChunks(
+    channel: TextChannel,
+    content: string,
+    inReplyTo: string,
+    files: any[]
+): Promise<DiscordMessage[]> {
+    const sentMessages: DiscordMessage[] = [];
+    const messages = splitMessage(content);
+    try {
+        for (let i = 0; i < messages.length; i++) {
+            const message = messages[i];
+            if (
+                message.trim().length > 0 ||
+                (i === messages.length - 1 && files && files.length > 0)
+            ) {
+                const options: any = {
+                    content: message.trim(),
+                };
+
+                // if (i === 0 && inReplyTo) {
+                //   // Reply to the specified message for the first chunk
+                //   options.reply = {
+                //     messageReference: inReplyTo,
+                //   };
+                // }
+
+                if (i === messages.length - 1 && files && files.length > 0) {
+                    // Attach files to the last message chunk
+                    options.files = files;
+                }
+
+                const m = await channel.send(options);
+                sentMessages.push(m);
+            }
+        }
+    } catch (error) {
+        elizaLogger.error("Error sending message:", error);
+    }
+
+    return sentMessages;
+}
+
+function splitMessage(content: string): string[] {
+    const messages: string[] = [];
+    let currentMessage = "";
+
+    const rawLines = content?.split("\n") || [];
+    // split all lines into MAX_MESSAGE_LENGTH chunks so any long lines are split
+    const lines = rawLines
+        .map((line) => {
+            const chunks = [];
+            while (line.length > MAX_MESSAGE_LENGTH) {
+                chunks.push(line.slice(0, MAX_MESSAGE_LENGTH));
+                line = line.slice(MAX_MESSAGE_LENGTH);
+            }
+            chunks.push(line);
+            return chunks;
+        })
+        .flat();
+
+    for (const line of lines) {
+        if (currentMessage.length + line.length + 1 > MAX_MESSAGE_LENGTH) {
+            messages.push(currentMessage.trim());
+            currentMessage = "";
+        }
+        currentMessage += line + "\n";
+    }
+
+    if (currentMessage.trim().length > 0) {
+        messages.push(currentMessage.trim());
+    }
+
+    return messages;
+}
+
+export function canSendMessage(channel) {
+    // validate input
+    if (!channel) {
+        return {
+            canSend: false,
+            reason: "No channel given",
+        };
+    }
+    // if it is a DM channel, we can always send messages
+    if (channel.type === ChannelType.DM) {
+        return {
+            canSend: true,
+            reason: null,
+        };
+    }
+    const botMember = channel.guild?.members.cache.get(channel.client.user.id);
+
+    if (!botMember) {
+        return {
+            canSend: false,
+            reason: "Not a guild channel or bot member not found",
+        };
+    }
+
+    // Required permissions for sending messages
+    const requiredPermissions = [
+        PermissionsBitField.Flags.ViewChannel,
+        PermissionsBitField.Flags.SendMessages,
+        PermissionsBitField.Flags.ReadMessageHistory,
+    ];
+
+    // Add thread-specific permission if it's a thread
+    if (channel instanceof ThreadChannel) {
+        requiredPermissions.push(
+            PermissionsBitField.Flags.SendMessagesInThreads
+        );
+    }
+
+    // Check permissions
+    const permissions = channel.permissionsFor(botMember);
+
+    if (!permissions) {
+        return {
+            canSend: false,
+            reason: "Could not retrieve permissions",
+        };
+    }
+
+    // Check each required permission
+    const missingPermissions = requiredPermissions.filter(
+        (perm) => !permissions.has(perm)
+    );
+
+    return {
+        canSend: missingPermissions.length === 0,
+        missingPermissions: missingPermissions,
+        reason:
+            missingPermissions.length > 0
+                ? `Missing permissions: ${missingPermissions.map((p) => String(p)).join(", ")}`
+                : null,
+    };
+}
+
+export function cosineSimilarity(
+    text1: string,
+    text2: string,
+    text3?: string
+): number {
+    const preprocessText = (text: string) =>
+        text
+            .toLowerCase()
+            .replace(/[^\w\s'_-]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+    const getWords = (text: string) => {
+        return text.split(" ").filter((word) => word.length > 1);
+    };
+
+    const words1 = getWords(preprocessText(text1));
+    const words2 = getWords(preprocessText(text2));
+    const words3 = text3 ? getWords(preprocessText(text3)) : [];
+
+    const freq1: { [key: string]: number } = {};
+    const freq2: { [key: string]: number } = {};
+    const freq3: { [key: string]: number } = {};
+
+    words1.forEach((word) => (freq1[word] = (freq1[word] || 0) + 1));
+    words2.forEach((word) => (freq2[word] = (freq2[word] || 0) + 1));
+    if (words3.length) {
+        words3.forEach((word) => (freq3[word] = (freq3[word] || 0) + 1));
+    }
+
+    const uniqueWords = new Set([
+        ...Object.keys(freq1),
+        ...Object.keys(freq2),
+        ...(words3.length ? Object.keys(freq3) : []),
+    ]);
+
+    let dotProduct = 0;
+    let magnitude1 = 0;
+    let magnitude2 = 0;
+    let magnitude3 = 0;
+
+    uniqueWords.forEach((word) => {
+        const val1 = freq1[word] || 0;
+        const val2 = freq2[word] || 0;
+        const val3 = freq3[word] || 0;
+
+        if (words3.length) {
+            // For three-way, calculate pairwise similarities
+            const sim12 = val1 * val2;
+            const sim23 = val2 * val3;
+            const sim13 = val1 * val3;
+
+            // Take maximum similarity between any pair
+            dotProduct += Math.max(sim12, sim23, sim13);
+        } else {
+            dotProduct += val1 * val2;
+        }
+
+        magnitude1 += val1 * val1;
+        magnitude2 += val2 * val2;
+        if (words3.length) {
+            magnitude3 += val3 * val3;
+        }
+    });
+
+    magnitude1 = Math.sqrt(magnitude1);
+    magnitude2 = Math.sqrt(magnitude2);
+    magnitude3 = words3.length ? Math.sqrt(magnitude3) : 1;
+
+    if (
+        magnitude1 === 0 ||
+        magnitude2 === 0 ||
+        (words3.length && magnitude3 === 0)
+    )
+        return 0;
+
+    // For two texts, use original calculation
+    if (!words3.length) {
+        return dotProduct / (magnitude1 * magnitude2);
+    }
+
+    // For three texts, use max magnitude pair to maintain scale
+    const maxMagnitude = Math.max(
+        magnitude1 * magnitude2,
+        magnitude2 * magnitude3,
+        magnitude1 * magnitude3
+    );
+
+    return dotProduct / maxMagnitude;
+}
+
+```
+
+`/root/eliza_new/packages/client-discord/src/index.ts`:
+
+```ts
+import {
+    getEmbeddingZeroVector,
+    stringToUuid,
+    elizaLogger,
+    Character,
+    Client as ElizaClient,
+    IAgentRuntime,
+} from "@elizaos/core";
+import {
+    Client,
+    Events,
+    GatewayIntentBits,
+    Guild,
+    MessageReaction,
+    Partials,
+    User,
+} from "discord.js";
+import { EventEmitter } from "events";
+import chat_with_attachments from "./actions/chat_with_attachments.ts";
+import download_media from "./actions/download_media.ts";
+import joinvoice from "./actions/joinvoice.ts";
+import leavevoice from "./actions/leavevoice.ts";
+import summarize from "./actions/summarize_conversation.ts";
+import transcribe_media from "./actions/transcribe_media.ts";
+import { MessageManager } from "./messages.ts";
+import channelStateProvider from "./providers/channelState.ts";
+import voiceStateProvider from "./providers/voiceState.ts";
+import { VoiceManager } from "./voice.ts";
+import { PermissionsBitField } from "discord.js";
+
+export class DiscordClient extends EventEmitter {
+    apiToken: string;
+    client: Client;
+    runtime: IAgentRuntime;
+    character: Character;
+    private messageManager: MessageManager;
+    private voiceManager: VoiceManager;
+
+    constructor(runtime: IAgentRuntime) {
+        super();
+
+        this.apiToken = runtime.getSetting("DISCORD_API_TOKEN") as string;
+        this.client = new Client({
+            intents: [
+                GatewayIntentBits.Guilds,
+                GatewayIntentBits.DirectMessages,
+                GatewayIntentBits.GuildVoiceStates,
+                GatewayIntentBits.MessageContent,
+                GatewayIntentBits.GuildMessages,
+                GatewayIntentBits.DirectMessageTyping,
+                GatewayIntentBits.GuildMessageTyping,
+                GatewayIntentBits.GuildMessageReactions,
+            ],
+            partials: [
+                Partials.Channel,
+                Partials.Message,
+                Partials.User,
+                Partials.Reaction,
+            ],
+        });
+
+        this.runtime = runtime;
+        this.voiceManager = new VoiceManager(this);
+        this.messageManager = new MessageManager(this, this.voiceManager);
+
+        this.client.once(Events.ClientReady, this.onClientReady.bind(this));
+        this.client.login(this.apiToken);
+
+        this.setupEventListeners();
+
+        this.runtime.registerAction(joinvoice);
+        this.runtime.registerAction(leavevoice);
+        this.runtime.registerAction(summarize);
+        this.runtime.registerAction(chat_with_attachments);
+        this.runtime.registerAction(transcribe_media);
+        this.runtime.registerAction(download_media);
+
+        this.runtime.providers.push(channelStateProvider);
+        this.runtime.providers.push(voiceStateProvider);
+    }
+
+    private setupEventListeners() {
+        // When joining to a new server
+        this.client.on("guildCreate", this.handleGuildCreate.bind(this));
+
+        this.client.on(
+            Events.MessageReactionAdd,
+            this.handleReactionAdd.bind(this)
+        );
+        this.client.on(
+            Events.MessageReactionRemove,
+            this.handleReactionRemove.bind(this)
+        );
+
+        // Handle voice events with the voice manager
+        this.client.on(
+            "voiceStateUpdate",
+            this.voiceManager.handleVoiceStateUpdate.bind(this.voiceManager)
+        );
+        this.client.on(
+            "userStream",
+            this.voiceManager.handleUserStream.bind(this.voiceManager)
+        );
+
+        // Handle a new message with the message manager
+        this.client.on(
+            Events.MessageCreate,
+            this.messageManager.handleMessage.bind(this.messageManager)
+        );
+
+        // Handle a new interaction
+        this.client.on(
+            Events.InteractionCreate,
+            this.handleInteractionCreate.bind(this)
+        );
+    }
+
+    async stop() {
+        try {
+            // disconnect websocket
+            // this unbinds all the listeners
+            await this.client.destroy();
+        } catch (e) {
+            elizaLogger.error("client-discord instance stop err", e);
+        }
+    }
+
+    private async onClientReady(readyClient: { user: { tag: any; id: any } }) {
+        elizaLogger.success(`Logged in as ${readyClient.user?.tag}`);
+
+        // Register slash commands
+        const commands = [
+            {
+                name: "joinchannel",
+                description: "Join a voice channel",
+                options: [
+                    {
+                        name: "channel",
+                        type: 7, // CHANNEL type
+                        description: "The voice channel to join",
+                        required: true,
+                        channel_types: [2], // GuildVoice type
+                    },
+                ],
+            },
+            {
+                name: "leavechannel",
+                description: "Leave the current voice channel",
+            },
+        ];
+
+        try {
+            await this.client.application?.commands.set(commands);
+            elizaLogger.success("Slash commands registered");
+        } catch (error) {
+            console.error("Error registering slash commands:", error);
+        }
+
+        // Required permissions for the bot
+        const requiredPermissions = [
+            // Text Permissions
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.SendMessagesInThreads,
+            PermissionsBitField.Flags.CreatePrivateThreads,
+            PermissionsBitField.Flags.CreatePublicThreads,
+            PermissionsBitField.Flags.EmbedLinks,
+            PermissionsBitField.Flags.AttachFiles,
+            PermissionsBitField.Flags.AddReactions,
+            PermissionsBitField.Flags.UseExternalEmojis,
+            PermissionsBitField.Flags.UseExternalStickers,
+            PermissionsBitField.Flags.MentionEveryone,
+            PermissionsBitField.Flags.ManageMessages,
+            PermissionsBitField.Flags.ReadMessageHistory,
+            // Voice Permissions
+            PermissionsBitField.Flags.Connect,
+            PermissionsBitField.Flags.Speak,
+            PermissionsBitField.Flags.UseVAD,
+            PermissionsBitField.Flags.PrioritySpeaker,
+        ].reduce((a, b) => a | b, 0n);
+
+        elizaLogger.success("Use this URL to add the bot to your server:");
+        elizaLogger.success(
+            `https://discord.com/api/oauth2/authorize?client_id=${readyClient.user?.id}&permissions=${requiredPermissions}&scope=bot%20applications.commands`
+        );
+        await this.onReady();
+    }
+
+    async handleReactionAdd(reaction: MessageReaction, user: User) {
+        try {
+            elizaLogger.log("Reaction added");
+
+            // Early returns
+            if (!reaction || !user) {
+                elizaLogger.warn("Invalid reaction or user");
+                return;
+            }
+
+            // Get emoji info
+            let emoji = reaction.emoji.name;
+            if (!emoji && reaction.emoji.id) {
+                emoji = `<:${reaction.emoji.name}:${reaction.emoji.id}>`;
+            }
+
+            // Fetch full message if partial
+            if (reaction.partial) {
+                try {
+                    await reaction.fetch();
+                } catch (error) {
+                    elizaLogger.error(
+                        "Failed to fetch partial reaction:",
+                        error
+                    );
+                    return;
+                }
+            }
+
+            // Generate IDs with timestamp to ensure uniqueness
+            const timestamp = Date.now();
+            const roomId = stringToUuid(
+                `${reaction.message.channel.id}-${this.runtime.agentId}`
+            );
+            const userIdUUID = stringToUuid(
+                `${user.id}-${this.runtime.agentId}`
+            );
+            const reactionUUID = stringToUuid(
+                `${reaction.message.id}-${user.id}-${emoji}-${timestamp}-${this.runtime.agentId}`
+            );
+
+            // Validate IDs
+            if (!userIdUUID || !roomId) {
+                elizaLogger.error("Invalid user ID or room ID", {
+                    userIdUUID,
+                    roomId,
+                });
+                return;
+            }
+
+            // Process message content
+            const messageContent = reaction.message.content || "";
+            const truncatedContent =
+                messageContent.length > 100
+                    ? `${messageContent.substring(0, 100)}...`
+                    : messageContent;
+            const reactionMessage = `*<${emoji}>: "${truncatedContent}"*`;
+
+            // Get user info
+            const userName = reaction.message.author?.username || "unknown";
+            const name = reaction.message.author?.displayName || userName;
+
+            // Ensure connection
+            await this.runtime.ensureConnection(
+                userIdUUID,
+                roomId,
+                userName,
+                name,
+                "discord"
+            );
+
+            // Create memory with retry logic
+            const memory = {
+                id: reactionUUID,
+                userId: userIdUUID,
+                agentId: this.runtime.agentId,
+                content: {
+                    text: reactionMessage,
+                    source: "discord",
+                    inReplyTo: stringToUuid(
+                        `${reaction.message.id}-${this.runtime.agentId}`
+                    ),
+                },
+                roomId,
+                createdAt: timestamp,
+                embedding: getEmbeddingZeroVector(),
+            };
+
+            try {
+                await this.runtime.messageManager.createMemory(memory);
+                elizaLogger.debug("Reaction memory created", {
+                    reactionId: reactionUUID,
+                    emoji,
+                    userId: user.id,
+                });
+            } catch (error) {
+                if (error.code === "23505") {
+                    // Duplicate key error
+                    elizaLogger.warn("Duplicate reaction memory, skipping", {
+                        reactionId: reactionUUID,
+                    });
+                    return;
+                }
+                throw error; // Re-throw other errors
+            }
+        } catch (error) {
+            elizaLogger.error("Error handling reaction:", error);
+        }
+    }
+
+    async handleReactionRemove(reaction: MessageReaction, user: User) {
+        elizaLogger.log("Reaction removed");
+        // if (user.bot) return;
+
+        let emoji = reaction.emoji.name;
+        if (!emoji && reaction.emoji.id) {
+            emoji = `<:${reaction.emoji.name}:${reaction.emoji.id}>`;
+        }
+
+        // Fetch the full message if it's a partial
+        if (reaction.partial) {
+            try {
+                await reaction.fetch();
+            } catch (error) {
+                console.error(
+                    "Something went wrong when fetching the message:",
+                    error
+                );
+                return;
+            }
+        }
+
+        const messageContent = reaction.message.content;
+        const truncatedContent =
+            messageContent.length > 50
+                ? messageContent.substring(0, 50) + "..."
+                : messageContent;
+
+        const reactionMessage = `*Removed <${emoji} emoji> from: "${truncatedContent}"*`;
+
+        const roomId = stringToUuid(
+            reaction.message.channel.id + "-" + this.runtime.agentId
+        );
+        const userIdUUID = stringToUuid(user.id);
+
+        // Generate a unique UUID for the reaction removal
+        const reactionUUID = stringToUuid(
+            `${reaction.message.id}-${user.id}-${emoji}-removed-${this.runtime.agentId}`
+        );
+
+        const userName = reaction.message.author.username;
+        const name = reaction.message.author.displayName;
+
+        await this.runtime.ensureConnection(
+            userIdUUID,
+            roomId,
+            userName,
+            name,
+            "discord"
+        );
+
+        try {
+            // Save the reaction removal as a message
+            await this.runtime.messageManager.createMemory({
+                id: reactionUUID, // This is the ID of the reaction removal message
+                userId: userIdUUID,
+                agentId: this.runtime.agentId,
+                content: {
+                    text: reactionMessage,
+                    source: "discord",
+                    inReplyTo: stringToUuid(
+                        reaction.message.id + "-" + this.runtime.agentId
+                    ), // This is the ID of the original message
+                },
+                roomId,
+                createdAt: Date.now(),
+                embedding: getEmbeddingZeroVector(),
+            });
+        } catch (error) {
+            console.error("Error creating reaction removal message:", error);
+        }
+    }
+
+    private handleGuildCreate(guild: Guild) {
+        console.log(`Joined guild ${guild.name}`);
+        this.voiceManager.scanGuild(guild);
+    }
+
+    private async handleInteractionCreate(interaction: any) {
+        if (!interaction.isCommand()) return;
+
+        switch (interaction.commandName) {
+            case "joinchannel":
+                await this.voiceManager.handleJoinChannelCommand(interaction);
+                break;
+            case "leavechannel":
+                await this.voiceManager.handleLeaveChannelCommand(interaction);
+                break;
+        }
+    }
+
+    private async onReady() {
+        const guilds = await this.client.guilds.fetch();
+        for (const [, guild] of guilds) {
+            const fullGuild = await guild.fetch();
+            this.voiceManager.scanGuild(fullGuild);
+        }
+    }
+}
+
+export function startDiscord(runtime: IAgentRuntime) {
+    return new DiscordClient(runtime);
+}
+
+export const DiscordClientInterface: ElizaClient = {
+    start: async (runtime: IAgentRuntime) => new DiscordClient(runtime),
+    stop: async (runtime: IAgentRuntime) => {
+        try {
+            // stop it
+            elizaLogger.log("Stopping discord client", runtime.agentId);
+            await runtime.clients.discord.stop();
+        } catch (e) {
+            elizaLogger.error("client-discord interface stop error", e);
+        }
+    },
+};
+
+```
+
+`/root/eliza_new/packages/client-discord/package.json`:
+
+```json
+{
+    "name": "@elizaos/client-discord",
+    "version": "0.1.7",
+    "type": "module",
+    "main": "dist/index.js",
+    "module": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+        "./package.json": "./package.json",
+        ".": {
+            "import": {
+                "@elizaos/source": "./src/index.ts",
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            }
+        }
+    },
+    "files": [
+        "dist"
+    ],
+    "dependencies": {
+        "@elizaos/core": "workspace:*",
+        "@elizaos/plugin-node": "workspace:*",
+        "@discordjs/opus": "github:discordjs/opus",
+        "@discordjs/rest": "2.4.0",
+        "@discordjs/voice": "0.17.0",
+        "discord.js": "14.16.3",
+        "libsodium-wrappers": "0.7.15",
+        "prism-media": "1.3.5",
+        "zod": "3.23.8"
+    },
+    "devDependencies": {
+        "tsup": "8.3.5"
+    },
+    "scripts": {
+        "build": "tsup --format esm --dts",
+        "dev": "tsup --format esm --dts --watch",
+        "lint": "eslint --fix  --cache ."
+    },
+    "trustedDependencies": {
+        "@discordjs/opus": "github:discordjs/opus",
+        "@discordjs/voice": "0.17.0"
+    },
+    "peerDependencies": {
+        "whatwg-url": "7.1.0"
+    }
+}
+
+```
+
+`/root/eliza_new/packages/client-discord/tsup.config.ts`:
+
+```ts
+import { defineConfig } from "tsup";
+
+export default defineConfig({
+    entry: ["src/index.ts"],
+    outDir: "dist",
+    sourcemap: true,
+    clean: true,
+    format: ["esm"], // Ensure you're targeting CommonJS
+    external: [
+        "dotenv", // Externalize dotenv to prevent bundling
+        "fs", // Externalize fs to use Node.js built-in module
+        "path", // Externalize other built-ins if necessary
+        "@reflink/reflink",
+        "@node-llama-cpp",
+        "https",
+        "http",
+        "agentkeepalive",
+        "fluent-ffmpeg",
+        // Add other modules you want to externalize
+    ],
+});
+
+```
+
+`/root/eliza_new/packages/client-discord/tsconfig.json`:
+
+```json
+{
+    "extends": "../core/tsconfig.json",
+    "compilerOptions": {
+        "outDir": "dist",
+        "rootDir": "src"
+    },
+    "include": [
+        "src/**/*.ts"
+    ]
+}
+```
+
+`/root/eliza_new/packages/client-discord/eslint.config.mjs`:
+
+```mjs
+import eslintGlobalConfig from "../../eslint.config.mjs";
+
+export default [...eslintGlobalConfig];
+
+```

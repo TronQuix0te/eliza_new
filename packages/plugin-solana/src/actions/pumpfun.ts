@@ -52,21 +52,23 @@ const debugTokenMetadata = async (tokenMetadata: CreateTokenMetadata) => {
     console.log("DEBUG - Token Metadata:", {
         name: tokenMetadata.name,
         symbol: tokenMetadata.symbol,
-        description: tokenMetadata.description
+        description: tokenMetadata.description,
     });
 
     if (tokenMetadata.file) {
         console.log("DEBUG - File Info:", {
             type: tokenMetadata.file.type,
-            size: tokenMetadata.file.size
+            size: tokenMetadata.file.size,
         });
 
         // Try to read a bit of the file to verify it's valid
         try {
             const reader = new FileReader();
             reader.onload = () => {
-                console.log("DEBUG - First 100 chars of file:",
-                    reader.result?.toString().substring(0, 100));
+                console.log(
+                    "DEBUG - First 100 chars of file:",
+                    reader.result?.toString().substring(0, 100)
+                );
             };
             reader.readAsDataURL(tokenMetadata.file);
         } catch (e) {
@@ -76,7 +78,6 @@ const debugTokenMetadata = async (tokenMetadata: CreateTokenMetadata) => {
         console.log("DEBUG - No file present in metadata");
     }
 };
-
 
 export const createAndBuyToken = async ({
     deployer,
@@ -340,34 +341,36 @@ export default {
 
         // Validate the generated content
         if (!isCreateAndBuyContent(runtime, content)) {
-            console.error("Invalid content for CREATE_AND_BUY_TOKEN action.");
+            console.error(
+                "Invalid content for CREATE_AND_BUY_TOKEN action."
+            );
             return false;
         }
 
         const { tokenMetadata, buyAmountSol } = content;
         /*
-            // Generate image if tokenMetadata.file is empty or invalid
-            if (!tokenMetadata.file || tokenMetadata.file.length < 100) {  // Basic validation
-                try {
-                    const imageResult = await generateImage({
-                        prompt: `logo for ${tokenMetadata.name} (${tokenMetadata.symbol}) token - ${tokenMetadata.description}`,
-                        width: 512,
-                        height: 512,
-                        count: 1
-                    }, runtime);
+                // Generate image if tokenMetadata.file is empty or invalid
+                if (!tokenMetadata.file || tokenMetadata.file.length < 100) {  // Basic validation
+                    try {
+                        const imageResult = await generateImage({
+                            prompt: `logo for ${tokenMetadata.name} (${tokenMetadata.symbol}) token - ${tokenMetadata.description}`,
+                            width: 512,
+                            height: 512,
+                            count: 1
+                        }, runtime);
 
-                    if (imageResult.success && imageResult.data && imageResult.data.length > 0) {
-                        // Remove the "data:image/png;base64," prefix if present
-                        tokenMetadata.file = imageResult.data[0].replace(/^data:image\/[a-z]+;base64,/, '');
-                    } else {
-                        console.error("Failed to generate image:", imageResult.error);
+                        if (imageResult.success && imageResult.data && imageResult.data.length > 0) {
+                            // Remove the "data:image/png;base64," prefix if present
+                            tokenMetadata.file = imageResult.data[0].replace(/^data:image\/[a-z]+;base64,/, '');
+                        } else {
+                            elizaLogger.error("Failed to generate image:", imageResult.error);
+                            return false;
+                        }
+                    } catch (error) {
+                        elizaLogger.error("Error generating image:", error);
                         return false;
                     }
-                } catch (error) {
-                    console.error("Error generating image:", error);
-                    return false;
-                }
-            } */
+                } */
 
         const imageResult = await generateImage(
             {
@@ -379,26 +382,27 @@ export default {
             runtime
         );
 
-        if (!imageResult.data || !imageResult.data[0]) {
-            throw new Error('Failed to generate image data');
-        }
+        tokenMetadata.image_description = imageResult.data[0].replace(
+            /^data:image\/[a-z]+;base64,/,
+            ""
+        );
 
-        // Ensure we have the complete data URL
-        const base64Data = imageResult.data[0].includes('data:image/png;base64,')
-            ? imageResult.data[0]
-            : `data:image/png;base64,${imageResult.data[0]}`;
-
-        // Create blob directly from the base64 data
-        const response = await fetch(base64Data);
-        const blob = await response.blob();
-
-        // Optional: Still save the file if needed
+        // Convert base64 string to Blob
+        const base64Data = tokenMetadata.image_description;
         const outputPath = path.join(
             process.cwd(),
             `generated_image_${Date.now()}.txt`
         );
-        fs.writeFileSync(outputPath, imageResult.data[0]);
+        fs.writeFileSync(outputPath, base64Data);
         console.log(`Base64 data saved to: ${outputPath}`);
+
+        const byteCharacters = atob(base64Data);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        const blob = new Blob([byteArray], { type: "image/png" });
 
         // Add the default decimals and convert file to Blob
         const fullTokenMetadata: CreateTokenMetadata = {
@@ -428,15 +432,15 @@ export default {
             );
 
             // Setup connection and SDK
-            const connection = new Connection(settings.RPC_URL!, {
+            const connection = new Connection(settings.SOLANA_RPC_URL!, {
                 commitment: "confirmed",
                 confirmTransactionInitialTimeout: 500000, // 120 seconds
-                wsEndpoint: settings.RPC_URL!.replace("https", "wss"),
+                wsEndpoint: settings.SOLANA_RPC_URL!.replace("https", "wss"),
             });
 
             const wallet = new Wallet(deployerKeypair);
             const provider = new AnchorProvider(connection, wallet, {
-                commitment: "finalized",
+                commitment: "confirmed",
             });
             const sdk = new PumpFunSDK(provider);
             // const slippage = runtime.getSetting("SLIPPAGE");

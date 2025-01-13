@@ -57,6 +57,7 @@ export const getEmbeddingConfig = (): EmbeddingConfig => ({
                 : "BGE",
 });
 
+
 async function getRemoteEmbedding(
     input: string,
     options: EmbeddingOptions

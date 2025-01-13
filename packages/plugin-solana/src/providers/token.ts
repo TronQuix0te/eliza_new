@@ -1109,6 +1109,36 @@ export class TokenProvider {
         }
     }
 
+    async fetchDexScreenerDataByToken(tokenAddress: string): Promise<any> {
+        try {
+            const response = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${tokenAddress}`);
+            const data = await response.json();
+
+            if (!data.pairs || data.pairs.length === 0) {
+                console.warn(`No data found for token ${tokenAddress}`);
+                return null;
+            }
+
+            // Find the pair where the base token matches the token address we're looking for
+            const pair = data.pairs.find((pair: any) => pair.baseToken.address.toLowerCase() === tokenAddress.toLowerCase());
+
+            if (!pair) {
+                console.warn(`No matching pair found for token ${tokenAddress}`);
+                return null;
+            }
+
+            return {
+                volume24hUSD: pair.volume.h24,
+                liquidityUSD: pair.liquidity.usd,
+                priceChange24h_percent: pair.priceChange.h24 || 0, // Use 0 if data not available
+                marketCap: pair.marketCap
+            };
+        } catch (error) {
+            console.error("Error fetching DexScreener data:", error);
+            return null;
+        }
+    }
+
     async fetchDexScreenerData(): Promise<DexScreenerData> {
         const cacheKey = `dexScreenerData_${this.tokenAddress}`;
         const cachedData = await this.getCachedData<DexScreenerData>(cacheKey);
@@ -1625,6 +1655,168 @@ export class TokenProvider {
         }
     }
 
+    private async fetchTrendingTokens(runtime: IAgentRuntime): Promise<any[]> {
+        try {
+            const apiKey = runtime.getSetting("BIRDEYE_API_KEY");
+            if (!apiKey) {
+                console.error("BIRDEYE_API_KEY not found in settings");
+                return [];
+            }
+
+            const options = {
+                method: 'GET',
+                headers: {
+                    'accept': 'application/json',
+                    'X-API-KEY': apiKey,
+                },
+            };
+
+            const response = await fetch('https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20', options);
+            const data = await response.json();
+
+            if (!data.success || !data.data.tokens) {
+                console.error("Failed to fetch trending tokens", data);
+                return [];
+            }
+
+            return data.data.tokens;
+        } catch (error) {
+            console.error("Error fetching trending tokens:", error);
+            return [];
+        }
+    }
+
+    async findGemTokens(runtime: IAgentRuntime, criteria: any): Promise<any[]> {
+        try {
+            const trendingTokens = await this.fetchTrendingTokens(runtime);
+
+            const gems = await Promise.all(trendingTokens.map(async (token: any) => {
+                const dexData = await this.fetchDexScreenerDataByToken(token.address);
+
+                if (!dexData) return null; // Skip if no DexScreener data
+
+                const processedData = {
+                    ...token,
+                    ...dexData,
+                };
+
+                const criteriaMatches = this.evaluateGemCriteria(processedData, criteria);
+                if (criteriaMatches.length > 0) {
+                    return {
+                        ...processedData,
+                        criteriaMatch: criteriaMatches
+                    };
+                }
+                return null;
+            }));
+
+            return gems.filter(Boolean); // Remove null entries
+        } catch (error) {
+            console.error("Error finding gem tokens:", error);
+            return [];
+        }
+    }
+
+    evaluateGemCriteria(token: any, criteria: any): string[] {
+        const matches = [];
+        if (token.liquidityUSD > criteria.liquidityThreshold) matches.push('High Liquidity');
+        if (token.volume24hUSD > criteria.volumeThreshold) matches.push('High Volume');
+        if (Math.abs(token.priceChange24h_percent) > criteria.priceSurgeThreshold) matches.push('Recent Price Surge');
+        if (token.marketCap < criteria.maxMarketCap) matches.push('Low Market Cap');
+        return matches;
+    }
+
+    private normalize(value: number, min: number, max: number): number {
+        return Math.max(0, Math.min(1, (value - min) / (max - min)));
+    }
+
+    calculateGemScore(token: any, criteria: any): number {
+        let score = 0;
+        const weights = {
+            volume24hUSD: 0.3,
+            liquidityUSD: 0.25,
+            priceChange24h_percent: 0.25,
+            marketCap: 0.2
+        };
+
+        score += this.normalize(token.volume24hUSD, 0, criteria.volumeThreshold) * weights.volume24hUSD;
+        score += this.normalize(token.liquidityUSD, 0, criteria.liquidityThreshold) * weights.liquidityUSD;
+        score += this.normalize(Math.abs(token.priceChange24h_percent), 0, criteria.priceSurgeThreshold) * weights.priceChange24h_percent;
+        score += (1 - this.normalize(token.marketCap, 0, criteria.maxMarketCap)) * weights.marketCap;
+
+        return Math.round(score * 100);
+    }
+
+
+
+    async provideDeeperAnalysis(token: any, criteria: any): Promise<string> {
+        function formatLargeNumber(num: number): string {
+            const absNum = Math.abs(num);
+            if (absNum >= 1000000000) {
+              return (num / 1000000000).toFixed(1) + ' B';
+            }
+            if (absNum >= 1000000) {
+              return (num / 1000000).toFixed(1) + ' M';
+            }
+            if (absNum >= 1000) {
+              return (num / 1000).toFixed(1) + ' K';
+            }
+            return num.toString();
+          }
+
+        const analysis = [];
+
+        if (token.volume24hUSD > criteria.volumeThreshold) {
+            analysis.push(`**${token.symbol}** has seen a **${formatLargeNumber(token.volume24hUSD)} USD** volume increase in the last 24 hours, indicating strong market interest.`);
+        }
+
+        if (token.liquidityUSD > criteria.liquidityThreshold) {
+            analysis.push(`With **${formatLargeNumber(token.liquidityUSD)} USD** in liquidity, **${token.symbol}** has robust market support, reducing slippage risks.`);
+        }
+
+        if (Math.abs(token.priceChange24h_percent) > criteria.priceSurgeThreshold) {
+            const change = token.priceChange24h_percent > 0 ? 'increase' : 'decrease';
+            analysis.push(`**${token.symbol}** has experienced a **${Math.abs(token.priceChange24h_percent).toFixed(1)}% ${change}** in price over the last 24 hours.`);
+        }
+
+        if (token.marketCap < criteria.maxMarketCap) {
+            analysis.push(`**${token.symbol}** has a **low market cap** of approximately ${formatLargeNumber(token.marketCap)} USD, suggesting room for significant growth if fundamentals are strong.`);
+        }
+
+        return analysis.join('\n- ');
+    }
+
+    provideRecommendation(token: any, gemScore: number): string {
+        if (gemScore > 80) {
+            return `**${token.name} (${token.symbol})** is showing **strong gem indicators**. **Consider for short-term trade** due to current momentum. Monitor for price stabilization before long-term investment.`;
+        } else if (gemScore > 50) {
+            return `**${token.name} (${token.symbol})** looks promising with moderate gem signals. **Good for portfolio diversification** if the project's fundamentals are solid.`;
+        } else {
+            return `**${token.name} (${token.symbol})** has some gem-like traits but **approach with caution** - further research into the project's fundamentals is necessary.`;
+        }
+    }
+
+    assessRisk(token: any, criteria: any): string {
+        let riskLevel = 'Low';
+
+        if (Math.abs(token.priceChange24h_percent) > 50) {
+            riskLevel = 'High'; // Extreme price movements
+        } else if (token.liquidityUSD < criteria.liquidityThreshold / 2) { // Half the threshold as a risk indicator
+            riskLevel = 'Moderate'; // Low liquidity might mean high slippage and volatility
+        }
+
+        return `**Risk:** ${riskLevel}, due to ${this.getRiskReason(token, criteria)}`;
+    }
+
+    getRiskReason(token: any, criteria: any): string {
+        if (Math.abs(token.priceChange24h_percent) > 50) {
+            return 'recent extreme volatility';
+        } else if (token.liquidityUSD < criteria.liquidityThreshold / 2) {
+            return 'low liquidity';
+        }
+        return 'stable market conditions';
+    }
+
     async shouldTradeToken(runtime: IAgentRuntime): Promise<boolean> {
         try {
             const tokenData = await this.getProcessedTokenData(runtime);
@@ -1729,7 +1921,7 @@ export class TokenProvider {
             output += `**💰 Price Performance**\n`;
             output += `1h: ${(data.tradeData.price_change_1h_percent || 0).toFixed(2)}%\n`;
             output += `24h: ${(data.tradeData.price_change_24h_percent || 0).toFixed(2)}%\n`;
-            
+
 
             // Volume Analysis
             const volume24hUSD = toBN(data.tradeData.volume_24h_usd || 0);

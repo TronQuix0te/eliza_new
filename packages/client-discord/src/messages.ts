@@ -48,6 +48,15 @@ interface MessageContext {
     timestamp: number;
 }
 
+interface ChannelData {
+    currentHandler: string;
+    lastMessageSent: number;
+    messages: { userId: UUID; userName: string; content: Content; }[];
+    previousContext?: MessageContext;
+    contextSimilarityThreshold?: number;
+    repetitionCount?: number; // Add this line
+}
+
 export type InterestChannels = {
     [key: string]: {
         currentHandler: string | undefined;
@@ -55,8 +64,9 @@ export type InterestChannels = {
         messages: { userId: UUID; userName: string; content: Content }[];
         previousContext?: MessageContext;
         contextSimilarityThreshold?: number;
+        repetitionCount?: number;
     };
-};
+}
 
 export class MessageManager {
     private client: Client;
@@ -74,7 +84,48 @@ export class MessageManager {
         this.attachmentManager = new AttachmentManager(this.runtime);
     }
 
+
+    private cleanRepeatedMessages(channelId: string, newMessage: string) {
+        if (!this.interestChannels[channelId]) return;
+
+        // Count repetitions before cleaning
+        const repetitionCount = this.interestChannels[channelId].messages.filter(
+            (msg) => msg.content.text === newMessage
+        ).length;
+
+        // Store repetition count before cleaning
+        this.interestChannels[channelId].repetitionCount = repetitionCount;
+
+        // Filter out repeated messages, only keeping the last occurrence
+        const cleanedMessages = this.interestChannels[channelId].messages.filter(
+            (msg, index, arr) => {
+                return msg.content.text !== newMessage || index === arr.length - 1;
+            }
+        );
+
+        // Update messages with the cleaned version
+        this.interestChannels[channelId].messages = cleanedMessages;
+    }
+
+    public clearChannelHistory(channelId: string) {
+        if (this.interestChannels[channelId]) {
+            elizaLogger.log(`Clearing history for channel ${channelId}`);
+            this.interestChannels[channelId].messages = [];
+            this.interestChannels[channelId].lastMessageSent = Date.now();
+        }
+    }
+
     async handleMessage(message: DiscordMessage) {
+        // Add at start of handler
+
+        elizaLogger.log("Received message:", {
+            content: message.content,
+            channelId: message.channelId,
+            hasInterest: this._checkInterest(message.channelId),
+        });
+
+        this.clearChannelHistory(message.channelId);
+
         if (
             message.interaction ||
             message.author.id ===
@@ -246,6 +297,12 @@ export class MessageManager {
             const { processedContent, attachments } =
                 await this.processMessageMedia(message);
 
+
+                elizaLogger.log("Processing message:", {
+                    processed: processedContent,
+                    hasAttachments: attachments.length > 0
+                });
+
             const audioAttachments = message.attachments.filter((attachment) =>
                 attachment.contentType?.startsWith("audio/")
             );
@@ -318,6 +375,9 @@ export class MessageManager {
                         content: content,
                     });
 
+                    // Add this line to clean repeated messages
+                    this.cleanRepeatedMessages(message.channelId, content.text);
+
                     // Trim to keep only recent messages
                     if (
                         this.interestChannels[message.channelId].messages
@@ -328,6 +388,28 @@ export class MessageManager {
                                 message.channelId
                             ].messages.slice(-MESSAGE_CONSTANTS.MAX_MESSAGES);
                     }
+                }
+
+                if (this.interestChannels[message.channelId]) {
+                    // Add new message
+                    this.interestChannels[message.channelId].messages.push({
+                        userId: userIdUUID,
+                        userName: userName,
+                        content: content,
+                    });
+
+                    // Trim to keep only recent messages
+                    if (
+                        this.interestChannels[message.channelId].messages
+                            .length > MESSAGE_CONSTANTS.MAX_MESSAGES
+                    ) {
+                        this.interestChannels[message.channelId].messages =
+                            this.interestChannels[
+                                message.channelId
+                            ].messages.slice(-MESSAGE_CONSTANTS.MAX_MESSAGES);
+                    }
+                        // Check and manage token count
+                        await this.manageTokenCount(message.channelId);
                 }
             }
 
@@ -349,6 +431,8 @@ export class MessageManager {
 
             if (!shouldIgnore) {
                 shouldIgnore = await this._shouldIgnore(message);
+
+                elizaLogger.log("Should ignore?", { shouldIgnore });
             }
 
             if (shouldIgnore) {
@@ -380,6 +464,18 @@ export class MessageManager {
                 shouldRespond = await this._shouldRespond(message, state);
             }
 
+            elizaLogger.log("Checking if should respond", {
+                hasInterest: this._checkInterest(message.channelId),
+                channelState: this.interestChannels[message.channelId]
+            });
+
+            if (shouldRespond) {
+                elizaLogger.log("Generating response...");
+                // ... response generation ...
+            } else {
+                elizaLogger.log("Decided not to respond");
+            }
+
             if (shouldRespond) {
                 const context = composeContext({
                     state,
@@ -390,14 +486,14 @@ export class MessageManager {
                 });
 
                 // simulate discord typing while generating a response
-                const stopTyping = this.simulateTyping(message)
+                const stopTyping = this.simulateTyping(message);
 
                 const responseContent = await this._generateResponse(
                     memory,
                     state,
                     context
                 ).finally(() => {
-                    stopTyping()
+                    stopTyping();
                 });
 
                 responseContent.text = responseContent.text?.trim();
@@ -501,6 +597,32 @@ export class MessageManager {
                 console.error("Error sending message:", error);
             }
         }
+    }
+
+    private async manageTokenCount(channelId: string) {
+        const channelState = this.interestChannels[channelId];
+        if (!channelState) return;
+
+        // Assume we have a function to count tokens, this is a placeholder
+        const tokenCount = await this.countTokens(channelState.messages);
+
+        if (tokenCount > 8000) {
+            elizaLogger.warn(`Token count for channel ${channelId} exceeded 8000. Clearing context.`);
+            channelState.messages = []; // Clear all messages
+            channelState.lastMessageSent = Date.now(); // Reset timestamp
+        }
+    }
+
+    private async countTokens(messages: { content: Content }[]): Promise<number> {
+        // Here you would implement or use an existing token counting method.
+        // For example, you might use the tokenizer from your model's library if available.
+        // This is a very basic approximation:
+        let totalTokens = 0;
+        for (const { content } of messages) {
+            // Assuming each character is roughly 4/3 tokens for English text
+            totalTokens += Math.ceil((content.text?.length || 0) * 4 / 3);
+        }
+        return totalTokens;
     }
 
     async cacheMessages(channel: TextChannel, count: number = 20) {
@@ -1332,7 +1454,7 @@ export class MessageManager {
         typingLoop();
 
         return function stopTyping() {
-            typing = false
-        }
+            typing = false;
+        };
     }
 }

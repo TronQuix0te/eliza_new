@@ -27,6 +27,7 @@ import channelStateProvider from "./providers/channelState.ts";
 import voiceStateProvider from "./providers/voiceState.ts";
 import { VoiceManager } from "./voice.ts";
 import { PermissionsBitField } from "discord.js";
+import { BalanceChecker } from "./utils/balanceChecker.ts";
 
 export class DiscordClient extends EventEmitter {
     apiToken: string;

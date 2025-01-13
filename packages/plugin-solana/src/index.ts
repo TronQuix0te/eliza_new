@@ -2,6 +2,7 @@ export * from "./providers/token.ts";
 export * from "./providers/wallet.ts";
 export * from "./providers/trustScoreProvider.ts";
 export * from "./evaluators/trust.ts";
+export * from "./actions/huntGemTokens";
 
 import { Plugin } from "@elizaos/core";
 import { executeSwap } from "./actions/swap.ts";
@@ -15,6 +16,7 @@ import { trustScoreProvider } from "./providers/trustScoreProvider.ts";
 import { trustEvaluator } from "./evaluators/trust.ts";
 import { TokenProvider } from "./providers/token.ts";
 import { WalletProvider } from "./providers/wallet.ts";
+import { huntGemTokens } from "./actions/huntGemTokens";
 
 export { TokenProvider, WalletProvider };
 
@@ -28,6 +30,7 @@ export const solanaPlugin: Plugin = {
         transferToken,
         executeSwapForDAO,
         take_order,
+        huntGemTokens,
     ],
     evaluators: [trustEvaluator],
     providers: [walletProvider, trustScoreProvider],

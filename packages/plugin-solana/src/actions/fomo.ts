@@ -479,6 +479,8 @@ export default {
         formData.append("description", tokenMetadata.description);
 
         // FIXME: does fomo.fund have an ipfs call?
+        console.log('Fetching with URL:', "https://pump.fun/api/ipfs");
+        console.log(`formData:`, formData);
         const metadataResponse = await fetch("https://pump.fun/api/ipfs", {
             method: "POST",
             body: formData,
